@@ -1,0 +1,23 @@
+{
+  "name": "@agiterra/exchange-tools",
+  "version": "0.1.0",
+  "description": "Shared Exchange primitives — crypto, HTTP helpers, SSE parsing, reconnect, connection. Used by server and adapters.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./crypto": "./src/crypto.ts",
+    "./http": "./src/http.ts",
+    "./sse": "./src/sse.ts",
+    "./reconnect": "./src/reconnect.ts",
+    "./connection": "./src/connection.ts"
+  },
+  "files": [
+    "src/"
+  ],
+  "devDependencies": {
+    "bun-types": "latest"
+  },
+  "license": "MIT",
+  "author": "Tim Garthwaite <https://github.com/mividtim>"
+}
