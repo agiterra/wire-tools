@@ -1,0 +1,11 @@
+{
+  "name": "exchange-tools",
+  "version": "0.1.0",
+  "description": "Shared Exchange primitives — crypto, HTTP helpers, SSE parsing, reconnect, connection. Used by server and adapters.",
+  "author": {
+    "name": "Tim Garthwaite",
+    "url": "https://github.com/mividtim"
+  },
+  "license": "MIT",
+  "keywords": ["exchange", "crypto", "sse", "http", "reconnect", "messaging"]
+}
