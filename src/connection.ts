@@ -77,7 +77,7 @@ export type ConnectionOptions = {
   heartbeatInterval?: number; // ms, default 120000
   deliver: DeliverFn;
   onError?: (error: unknown) => void;
-  onConnect?: () => void;
+  onConnect?: (sessionId: string) => void;
   onDisconnect?: () => void;
 };
 
@@ -151,10 +151,15 @@ export class WireConnection {
           this.opts.agentId,
           this.opts.agentName,
           this.publicKey!,
+          this.signingKey!,
           this.opts.subscriptions,
         );
-        this.sessionId = await connect(this.opts.url, this.opts.agentId);
-        this.opts.onConnect?.();
+        this.sessionId = await connect(
+          this.opts.url,
+          this.opts.agentId,
+          this.signingKey!,
+        );
+        this.opts.onConnect?.(this.sessionId!);
       },
       {
         shouldStop: () => this.stopped,
@@ -169,8 +174,13 @@ export class WireConnection {
 
     const interval = this.opts.heartbeatInterval ?? 120_000;
     this.heartbeatTimer = setInterval(() => {
-      if (this.sessionId)
-        heartbeatHttp(this.opts.url, this.opts.agentId, this.sessionId);
+      if (this.sessionId && this.signingKey)
+        heartbeatHttp(
+          this.opts.url,
+          this.opts.agentId,
+          this.sessionId,
+          this.signingKey,
+        );
     }, interval);
 
     this.streamLoop();
@@ -183,8 +193,13 @@ export class WireConnection {
       this.heartbeatTimer = null;
     }
     this.abortController?.abort();
-    if (this.sessionId) {
-      await disconnect(this.opts.url, this.sessionId);
+    if (this.sessionId && this.signingKey) {
+      await disconnect(
+        this.opts.url,
+        this.opts.agentId,
+        this.sessionId,
+        this.signingKey,
+      );
       this.sessionId = null;
     }
   }
@@ -192,9 +207,15 @@ export class WireConnection {
   // --- Ack ---
 
   async ack(seq: number): Promise<void> {
-    if (!this.sessionId) return;
+    if (!this.sessionId || !this.signingKey) return;
     try {
-      await ackHttp(this.opts.url, this.sessionId, seq);
+      await ackHttp(
+        this.opts.url,
+        this.opts.agentId,
+        this.sessionId,
+        seq,
+        this.signingKey,
+      );
     } catch (e) {
       this.opts.onError?.(e);
     }
@@ -364,11 +385,16 @@ export class WireConnection {
               this.opts.agentId,
               this.opts.agentName,
               pubB64,
+              this.signingKey,
               this.opts.subscriptions,
             ).catch(() => {});
           }
-          this.sessionId = await connect(this.opts.url, this.opts.agentId);
-          this.opts.onConnect?.();
+          this.sessionId = await connect(
+            this.opts.url,
+            this.opts.agentId,
+            this.signingKey!,
+          );
+          this.opts.onConnect?.(this.sessionId!);
         },
         {
           shouldStop: () => this.stopped,
