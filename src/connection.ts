@@ -1,8 +1,8 @@
 /**
- * ExchangeConnection — stateful connection to an Exchange server.
+ * WireConnection — stateful connection to a Wire server.
  *
  * Composes the stateless tools (crypto, http, sse, reconnect) into the
- * standard Exchange protocol lifecycle, plus an inbound message pipeline:
+ * standard Wire protocol lifecycle, plus an inbound message pipeline:
  *
  *   SSE event → channel handler → enrichment pipeline → deliver
  *
@@ -18,12 +18,12 @@ import {
   disconnect,
   ack as ackHttp,
   heartbeat as heartbeatHttp,
-  type ExchangeEvent,
+  type WireEvent,
 } from "./http.js";
 import { parseSSEChunk } from "./sse.js";
 import { retryWithBackoff } from "./reconnect.js";
 
-export type { ExchangeEvent };
+export type { WireEvent };
 
 // --- Channel handler types ---
 
@@ -33,7 +33,7 @@ export type ChannelResult = {
 };
 
 export type ChannelHandler = {
-  /** Process a raw Exchange event into a ChannelResult. */
+  /** Process a raw Wire event into a ChannelResult. */
   process: (
     payload: unknown,
     validatorResult: unknown,
@@ -51,7 +51,7 @@ export type EnrichmentResult = {
 
 export type EnrichmentContext = {
   channel: ChannelResult;
-  raw: ExchangeEvent;
+  raw: WireEvent;
   prior: EnrichmentResult[];
 };
 
@@ -60,7 +60,7 @@ export type Enricher = (ctx: EnrichmentContext) => Promise<EnrichmentResult[]>;
 // --- Delivery types ---
 
 export type DeliveryPayload = {
-  raw: ExchangeEvent;
+  raw: WireEvent;
   channel: ChannelResult;
   enrichment: EnrichmentResult[];
 };
@@ -81,7 +81,7 @@ export type ConnectionOptions = {
   onDisconnect?: () => void;
 };
 
-export class ExchangeConnection {
+export class WireConnection {
   private opts: ConnectionOptions;
   private signingKey: CryptoKey | null = null;
   private publicKey: string | null = null;
@@ -120,7 +120,7 @@ export class ExchangeConnection {
 
   /**
    * Register a channel handler for a topic pattern.
-   * The handler processes raw Exchange events into ChannelResult.
+   * The handler processes raw Wire events into ChannelResult.
    */
   registerChannel(topic: string, handler: ChannelHandler): void {
     this.channelHandlers.set(topic, handler);
@@ -160,7 +160,7 @@ export class ExchangeConnection {
         shouldStop: () => this.stopped,
         onError: (e, ms) =>
           this.opts.onError?.(
-            new Error(`Exchange startup failed: ${e}; retrying in ${ms}ms`),
+            new Error(`Wire startup failed: ${e}; retrying in ${ms}ms`),
           ),
       },
     );
@@ -202,7 +202,7 @@ export class ExchangeConnection {
 
   // --- Inbound pipeline ---
 
-  private async handleEvent(event: ExchangeEvent): Promise<void> {
+  private async handleEvent(event: WireEvent): Promise<void> {
     // Skip own messages
     if (event.source === this.opts.agentId) {
       this.ack(event.seq);
@@ -285,7 +285,7 @@ export class ExchangeConnection {
     return this.enrichmentPipelines.get("*") ?? [];
   }
 
-  private extractValidatorResult(event: ExchangeEvent): unknown {
+  private extractValidatorResult(event: WireEvent): unknown {
     if (
       typeof event.payload === "object" &&
       event.payload !== null &&
@@ -325,7 +325,7 @@ export class ExchangeConnection {
         buf = remaining;
         for (const raw of events) {
           try {
-            const event = JSON.parse(raw) as ExchangeEvent;
+            const event = JSON.parse(raw) as WireEvent;
             await this.handleEvent(event);
           } catch {}
         }
@@ -346,7 +346,7 @@ export class ExchangeConnection {
       } catch (e) {
         if (this.stopped) return;
         this.opts.onError?.(
-          new Error(`Exchange SSE error: ${e}; retrying in ${backoff}ms`),
+          new Error(`Wire SSE error: ${e}; retrying in ${backoff}ms`),
         );
       }
 
@@ -375,7 +375,7 @@ export class ExchangeConnection {
           onError: (e, ms) =>
             this.opts.onError?.(
               new Error(
-                `Exchange reconnect failed: ${e}; retrying in ${ms}ms`,
+                `Wire reconnect failed: ${e}; retrying in ${ms}ms`,
               ),
             ),
         },

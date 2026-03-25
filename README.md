@@ -1,6 +1,6 @@
-# @agiterra/exchange-tools
+# @agiterra/wire-tools
 
-Shared primitives for The Exchange ecosystem. Used by the server, adapters,
+Shared primitives for The Wire ecosystem. Used by the server, adapters,
 and channel plugins.
 
 ## What's included
@@ -11,9 +11,9 @@ and channel plugins.
 | `http` | Stateless REST helpers: register, connect, disconnect, ack, heartbeat |
 | `sse` | SSE chunk parser |
 | `reconnect` | Exponential backoff retry helper |
-| `connection` | `ExchangeConnection` class — lifecycle + message pipeline |
+| `connection` | `WireConnection` class — lifecycle + message pipeline |
 
-## ExchangeConnection
+## WireConnection
 
 The main interface for adapter authors. Manages:
 - Key loading, agent registration, session management
@@ -22,21 +22,21 @@ The main interface for adapter authors. Manages:
 - Inbound message pipeline: channel handlers → enrichment → delivery
 
 ```typescript
-import { ExchangeConnection } from "@agiterra/exchange-tools";
+import { WireConnection } from "@agiterra/wire-tools";
 
-const conn = new ExchangeConnection({
+const conn = new WireConnection({
   url: "http://localhost:9800",
   agentId: "my-agent",
   agentName: "My Agent",
   deliver(payload) {
-    // payload.raw — original Exchange event
+    // payload.raw — original Wire event
     // payload.channel — { text, metadata } from channel handler
     // payload.enrichment — results from enrichment pipeline
     console.log(payload.channel.text);
   },
 });
 
-// Register a channel handler (e.g. from @agiterra/exchange-ipc)
+// Register a channel handler (e.g. from @agiterra/wire-ipc)
 conn.registerChannel("ipc", myIpcHandler);
 
 // Configure enrichment pipeline per channel
@@ -62,12 +62,12 @@ SSE event
 ## Building an adapter
 
 An adapter is ~100 lines that:
-1. Creates an `ExchangeConnection` with a `deliver` callback
+1. Creates a `WireConnection` with a `deliver` callback
 2. Registers channel handlers (e.g. IPC)
 3. Wires the deliver callback to the runtime (MCP, Open Claw, etc.)
 4. Handles process lifecycle (signals, stdin detection)
 
-See `@agiterra/exchange-claude-code` and `@agiterra/exchange-openclaw` as
+See `@agiterra/wire-claude-code` and `@agiterra/wire-openclaw` as
 reference implementations.
 
 ## Enrichment
@@ -89,5 +89,5 @@ const personaiEnricher = async (ctx) => {
 };
 ```
 
-Agents compose pipelines per channel. See Personai and Exchange docs for
+Agents compose pipelines per channel. See Personai and Wire docs for
 wiring examples.

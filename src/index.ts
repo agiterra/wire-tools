@@ -1,8 +1,8 @@
 // Connection + pipeline types (most adapter authors start here)
 export {
-  ExchangeConnection,
+  WireConnection,
   type ConnectionOptions,
-  type ExchangeEvent,
+  type WireEvent,
   type ChannelResult,
   type ChannelHandler,
   type EnrichmentResult,

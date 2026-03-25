@@ -1,7 +1,7 @@
 /**
- * Ed25519 key management and signing for Exchange agents.
+ * Ed25519 key management and signing for Wire agents.
  *
- * Keys stored as PKCS8 (private) and raw base64 (public) at ~/.exchange/keys/.
+ * Keys stored as PKCS8 (private) and raw base64 (public) at ~/.wire/keys/.
  * Uses Web Crypto API — works in Node, Bun, and Deno.
  */
 
@@ -27,7 +27,7 @@ export async function loadOrCreateKey(
   agentId: string,
   dir?: string,
 ): Promise<KeyPair> {
-  const keyDir = dir ?? join(homedir(), ".exchange", "keys");
+  const keyDir = dir ?? join(homedir(), ".wire", "keys");
   const keyPath = join(keyDir, `${agentId}.key`);
 
   if (existsSync(keyPath)) {

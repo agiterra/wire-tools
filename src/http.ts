@@ -1,11 +1,11 @@
 /**
- * Stateless HTTP helpers for Exchange REST API.
+ * Stateless HTTP helpers for Wire REST API.
  *
  * Core protocol operations only. IPC-specific helpers (webhook registration,
- * signed message sending) belong in @agiterra/exchange-ipc.
+ * signed message sending) belong in @agiterra/wire-ipc.
  */
 
-export type ExchangeEvent = {
+export type WireEvent = {
   seq: number;
   source: string;
   topic: string;
@@ -32,7 +32,7 @@ export async function register(
     }),
   });
   if (!res.ok) {
-    throw new Error(`Exchange register failed (${res.status}): ${await res.text()}`);
+    throw new Error(`Wire register failed (${res.status}): ${await res.text()}`);
   }
 }
 
@@ -46,7 +46,7 @@ export async function connect(
     body: JSON.stringify({ agent_id: agentId }),
   });
   if (!res.ok) {
-    throw new Error(`Exchange connect failed (${res.status}): ${await res.text()}`);
+    throw new Error(`Wire connect failed (${res.status}): ${await res.text()}`);
   }
   const data = (await res.json()) as { session_id: string };
   return data.session_id;
@@ -74,7 +74,7 @@ export async function ack(
     body: JSON.stringify({ session_id: sessionId, seq }),
   });
   if (!res.ok) {
-    throw new Error(`Exchange ack failed (${res.status}): ${await res.text()}`);
+    throw new Error(`Wire ack failed (${res.status}): ${await res.text()}`);
   }
 }
 
