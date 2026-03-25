@@ -1,7 +1,7 @@
 {
   "name": "wire-tools",
-  "version": "0.1.0",
-  "description": "Shared Wire primitives — crypto, HTTP helpers, SSE parsing, reconnect, connection. Used by server and adapters.",
+  "version": "0.2.0",
+  "description": "Shared Wire primitives — crypto, HTTP helpers, SSE parsing, reconnect, connection, webhook channel handler. Used by server and adapters.",
   "author": {
     "name": "Tim Garthwaite",
     "url": "https://github.com/mividtim"
