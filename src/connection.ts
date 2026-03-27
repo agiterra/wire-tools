@@ -184,6 +184,11 @@ export class WireConnection {
 
     const interval = this.opts.heartbeatInterval ?? 10_000;
     this.log.info({ event: "heartbeat_timer_start", interval }, "starting heartbeat timer");
+    // Canary: test if setInterval fires at all in this runtime
+    const canary = setInterval(() => {
+      this.log.info({ event: "canary_tick" }, "canary");
+      clearInterval(canary);
+    }, 3000);
     this.heartbeatTimer = setInterval(() => {
       if (this.sessionId && this.signingKey) {
         heartbeatHttp(
