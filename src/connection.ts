@@ -183,14 +183,18 @@ export class WireConnection {
     if (this.stopped) return;
 
     const interval = this.opts.heartbeatInterval ?? 10_000;
+    this.log.info({ event: "heartbeat_timer_start", interval }, "starting heartbeat timer");
     this.heartbeatTimer = setInterval(() => {
-      if (this.sessionId && this.signingKey)
+      if (this.sessionId && this.signingKey) {
         heartbeatHttp(
           this.opts.url,
           this.opts.agentId,
           this.sessionId,
           this.signingKey,
         );
+      } else {
+        this.log.warn({ event: "heartbeat_skip", hasSession: !!this.sessionId, hasKey: !!this.signingKey }, "heartbeat skipped — missing session or key");
+      }
     }, interval);
 
     this.streamLoop();
