@@ -8,10 +8,12 @@
  * signed message sending) belong in @agiterra/wire-ipc.
  */
 
+import { join } from "path";
 import { signBody } from "./crypto.js";
 import { createLogger } from "./logger.js";
 
-const log = createLogger("wire-http");
+const WIRE_LOG = join(process.env.HOME ?? "/tmp", ".wire", "wire-connection.jsonl");
+const log = createLogger("wire-http", WIRE_LOG);
 
 export type WireEvent = {
   seq: number;
@@ -84,13 +86,18 @@ export async function disconnect(
   signingKey: CryptoKey,
 ): Promise<void> {
   const body = JSON.stringify({ session_id: sessionId, agent_id: agentId });
-  await fetch(`${url}/agents/disconnect`, {
-    method: "POST",
-    headers: await signedHeaders(body, signingKey),
-    body,
-  }).catch((e) => {
+  try {
+    const res = await fetch(`${url}/agents/disconnect`, {
+      method: "POST",
+      headers: await signedHeaders(body, signingKey),
+      body,
+    });
+    if (!res.ok) {
+      log.error({ event: "disconnect_rejected", agentId, sessionId, status: res.status }, "disconnect rejected");
+    }
+  } catch (e) {
     log.error({ event: "disconnect_failed", agentId, sessionId, err: e }, "disconnect failed");
-  });
+  }
 }
 
 export async function ack(
@@ -118,14 +125,21 @@ export async function heartbeat(
   signingKey: CryptoKey,
 ): Promise<void> {
   const body = JSON.stringify({ agent_id: agentId, session_id: sessionId });
-  await fetch(
-    `${url}/agents/${agentId}/sessions/${sessionId}/heartbeat`,
-    {
-      method: "POST",
-      headers: await signedHeaders(body, signingKey),
-      body,
-    },
-  ).catch((e) => {
+  try {
+    const res = await fetch(
+      `${url}/agents/${agentId}/sessions/${sessionId}/heartbeat`,
+      {
+        method: "POST",
+        headers: await signedHeaders(body, signingKey),
+        body,
+      },
+    );
+    if (!res.ok) {
+      log.error({ event: "heartbeat_rejected", agentId, sessionId, status: res.status }, "heartbeat rejected");
+    } else {
+      log.debug({ event: "heartbeat_ok", agentId, sessionId }, "heartbeat ok");
+    }
+  } catch (e) {
     log.error({ event: "heartbeat_failed", agentId, sessionId, err: e }, "heartbeat failed");
-  });
+  }
 }
