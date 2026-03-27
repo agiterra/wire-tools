@@ -376,7 +376,10 @@ export class WireConnection {
     try {
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          this.log.warn({ event: "sse_stream_ended", session: this.sessionId }, "SSE stream reader returned done=true");
+          break;
+        }
         buf += decoder.decode(value, { stream: true });
         const { events, remaining } = parseSSEChunk(buf);
         buf = remaining;
