@@ -11,6 +11,8 @@
  * by the agent.
  */
 
+import { writeFileSync } from "fs";
+import { join } from "path";
 import { loadOrCreateKey, derivePublicKeyB64 } from "./crypto.js";
 import {
   register,
@@ -22,6 +24,24 @@ import {
 } from "./http.js";
 import { parseSSEChunk } from "./sse.js";
 import { retryWithBackoff } from "./reconnect.js";
+
+const WIRE_LOG = join(process.env.HOME ?? "/tmp", ".wire", "wire-connection.log");
+
+function formatError(e: unknown): string {
+  if (e instanceof Error) {
+    const props = Object.getOwnPropertyNames(e)
+      .filter(k => k !== "stack" && k !== "message")
+      .map(k => `${k}=${JSON.stringify((e as any)[k])}`)
+      .join(" ");
+    return `${e.message}${props ? " " + props : ""}\n${e.stack}`;
+  }
+  return String(e);
+}
+
+function log(agentId: string, ...args: unknown[]): void {
+  const line = `${new Date().toISOString()} [${agentId}] ${args.map(a => a instanceof Error ? formatError(a) : typeof a === "string" ? a : JSON.stringify(a)).join(" ")}\n`;
+  try { writeFileSync(WIRE_LOG, line, { flag: "a" }); } catch {}
+}
 
 export type { WireEvent };
 
@@ -226,8 +246,12 @@ export class WireConnection {
   // --- Inbound pipeline ---
 
   private async handleEvent(event: WireEvent): Promise<void> {
+    const id = this.opts.agentId;
+    log(id, `RECV seq=${event.seq} topic=${event.topic} source=${event.source}`);
+
     // Skip own messages
     if (event.source === this.opts.agentId) {
+      log(id, `SKIP seq=${event.seq} (own message)`);
       this.ack(event.seq);
       return;
     }
@@ -235,16 +259,18 @@ export class WireConnection {
     // 1. Find channel handler for this topic
     const handler = this.findChannelHandler(event.topic);
     const validatorResult = this.extractValidatorResult(event);
+    log(id, `HANDLER seq=${event.seq} topic=${event.topic} found=${!!handler}`);
 
     let channelResult: ChannelResult;
     if (handler) {
       const result = handler.process(event.payload, validatorResult);
       if (!result) {
-        // Handler rejected the event (returned null)
+        log(id, `REJECTED seq=${event.seq} (handler returned null)`);
         this.ack(event.seq);
         return;
       }
       channelResult = result;
+      log(id, `PROCESSED seq=${event.seq} text=${channelResult.text.slice(0, 100)}`);
     } else {
       // No handler — pass through raw payload as text
       channelResult = {
@@ -254,10 +280,12 @@ export class WireConnection {
             : JSON.stringify(event.payload),
         metadata: { source: event.source, topic: event.topic },
       };
+      log(id, `PASSTHROUGH seq=${event.seq} text=${channelResult.text.slice(0, 100)}`);
     }
 
     // 2. Run enrichment pipeline
     const enrichers = this.findEnrichmentPipeline(event.topic);
+    log(id, `ENRICH seq=${event.seq} stages=${enrichers.length}`);
     let enrichment: EnrichmentResult[] = [];
     for (const enricher of enrichers) {
       try {
@@ -268,15 +296,19 @@ export class WireConnection {
         });
         enrichment = [...enrichment, ...results];
       } catch (e) {
+        log(id, `ENRICH_ERROR seq=${event.seq}`, e);
         this.opts.onError?.(e);
       }
     }
 
     // 3. Deliver to adapter
+    log(id, `DELIVER seq=${event.seq}`);
     try {
       await this.opts.deliver({ raw: event, channel: channelResult, enrichment });
+      log(id, `DELIVER_OK seq=${event.seq}`);
       this.ack(event.seq);
     } catch (e) {
+      log(id, `DELIVER_FAIL seq=${event.seq}`, e);
       this.opts.onError?.(e);
     }
   }
@@ -325,6 +357,7 @@ export class WireConnection {
   private lastEventId: string | null = null;
 
   private async streamOnce(): Promise<void> {
+    log(this.opts.agentId, `SSE_CONNECT session=${this.sessionId}`);
     const streamUrl = `${this.opts.url}/agents/${this.opts.agentId}/stream?session_id=${this.sessionId}`;
     this.abortController = new AbortController();
     const headers: Record<string, string> = {
@@ -368,7 +401,9 @@ export class WireConnection {
           try {
             const event = JSON.parse(sseEvent.data) as WireEvent;
             await this.handleEvent(event);
-          } catch {}
+          } catch (e) {
+            log(this.opts.agentId, `SSE_PARSE_ERROR data=${sseEvent.data?.slice(0, 200)}`, e);
+          }
         }
       }
     } finally {
