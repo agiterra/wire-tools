@@ -73,8 +73,9 @@ export type ConnectionOptions = {
   url: string;
   agentId: string;
   agentName: string;
+  ccSessionId?: string; // Identifies the Claude Code session (survives SSE reconnects)
   subscriptions?: string[];
-  heartbeatInterval?: number; // ms, default 120000
+  heartbeatInterval?: number; // ms, default 20000
   deliver: DeliverFn;
   onError?: (error: unknown) => void;
   onConnect?: (sessionId: string) => void;
@@ -158,6 +159,7 @@ export class WireConnection {
           this.opts.url,
           this.opts.agentId,
           this.signingKey!,
+          this.opts.ccSessionId,
         );
         this.opts.onConnect?.(this.sessionId!);
       },
@@ -172,7 +174,7 @@ export class WireConnection {
 
     if (this.stopped) return;
 
-    const interval = this.opts.heartbeatInterval ?? 120_000;
+    const interval = this.opts.heartbeatInterval ?? 20_000;
     this.heartbeatTimer = setInterval(() => {
       if (this.sessionId && this.signingKey)
         heartbeatHttp(
@@ -319,19 +321,33 @@ export class WireConnection {
 
   // --- SSE ---
 
+  // Track last event ID for reconnect (SSE spec Last-Event-ID)
+  private lastEventId: string | null = null;
+
   private async streamOnce(): Promise<void> {
     const streamUrl = `${this.opts.url}/agents/${this.opts.agentId}/stream?session_id=${this.sessionId}`;
     this.abortController = new AbortController();
+    const headers: Record<string, string> = {
+      Accept: "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    };
+    // Send Last-Event-ID on reconnect so server can resume from where we left off
+    if (this.lastEventId) {
+      headers["Last-Event-ID"] = this.lastEventId;
+    }
     const res = await fetch(streamUrl, {
       signal: this.abortController.signal,
-      headers: {
-        Accept: "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
+      headers,
     });
-    if (!res.ok || !res.body)
+    if (!res.ok || !res.body) {
+      // Session rejected (reaped or invalid) — clear so reconnect creates a new one
+      if (res.status === 403) {
+        this.sessionId = null;
+        this.lastEventId = null;
+      }
       throw new Error(`SSE failed (${res.status})`);
+    }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -344,9 +360,13 @@ export class WireConnection {
         buf += decoder.decode(value, { stream: true });
         const { events, remaining } = parseSSEChunk(buf);
         buf = remaining;
-        for (const raw of events) {
+        for (const sseEvent of events) {
+          // Track last event ID for reconnect
+          if (sseEvent.id) {
+            this.lastEventId = sseEvent.id;
+          }
           try {
-            const event = JSON.parse(raw) as WireEvent;
+            const event = JSON.parse(sseEvent.data) as WireEvent;
             await this.handleEvent(event);
           } catch {}
         }
@@ -376,6 +396,10 @@ export class WireConnection {
       backoff = Math.min(backoff * 2, 30000);
       if (this.stopped) return;
 
+      // Reconnect: keep existing sessionId — the server marks the session
+      // stale on SSE abort but doesn't destroy it. When we re-open the SSE
+      // stream with the same session_id, the server resurrects it and replays
+      // from our cursor. Only create a new session if the stream fails (403).
       await retryWithBackoff(
         async () => {
           if (this.signingKey) {
@@ -389,12 +413,19 @@ export class WireConnection {
               this.opts.subscriptions,
             ).catch(() => {});
           }
-          this.sessionId = await connect(
-            this.opts.url,
-            this.opts.agentId,
-            this.signingKey!,
-          );
-          this.opts.onConnect?.(this.sessionId!);
+          // Don't create a new session — reuse the existing one.
+          // streamOnce() will attempt to reconnect with the same sessionId.
+          // If the server rejects it (session reaped), streamOnce throws and
+          // we'll create a new session on the next retry.
+          if (!this.sessionId) {
+            this.sessionId = await connect(
+              this.opts.url,
+              this.opts.agentId,
+              this.signingKey!,
+              this.opts.ccSessionId,
+            );
+            this.opts.onConnect?.(this.sessionId!);
+          }
         },
         {
           shouldStop: () => this.stopped,

@@ -57,8 +57,11 @@ export async function connect(
   url: string,
   agentId: string,
   signingKey: CryptoKey,
+  ccSessionId?: string,
 ): Promise<string> {
-  const body = JSON.stringify({ agent_id: agentId });
+  const payload: Record<string, string> = { agent_id: agentId };
+  if (ccSessionId) payload.cc_session_id = ccSessionId;
+  const body = JSON.stringify(payload);
   const res = await fetch(`${url}/agents/connect`, {
     method: "POST",
     headers: await signedHeaders(body, signingKey),
