@@ -408,9 +408,11 @@ export class WireConnection {
       try {
         await this.streamOnce();
         if (this.stopped) return;
+        this.log.warn({ event: "sse_stream_exited" }, "streamOnce returned without error");
         backoff = 1000;
       } catch (e) {
         if (this.stopped) return;
+        this.log.error({ event: "sse_error", err: e, backoff }, "SSE error, reconnecting");
         this.opts.onError?.(
           new Error(`Wire SSE error: ${e}; retrying in ${backoff}ms`),
         );
