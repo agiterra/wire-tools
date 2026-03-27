@@ -330,14 +330,18 @@ export class WireConnection {
     while (!this.stopped) {
       await new Promise((r) => setTimeout(r, intervalMs));
       if (this.stopped) return;
-      this.log.info({ event: "heartbeat_tick", session: this.sessionId }, "heartbeat tick");
       if (this.sessionId && this.signingKey) {
-        heartbeatHttp(
-          this.opts.url,
-          this.opts.agentId,
-          this.sessionId,
-          this.signingKey,
-        );
+        try {
+          await heartbeatHttp(
+            this.opts.url,
+            this.opts.agentId,
+            this.sessionId,
+            this.signingKey,
+          );
+          this.log.info({ event: "heartbeat_ok", session: this.sessionId }, "heartbeat ok");
+        } catch (e) {
+          this.log.error({ event: "heartbeat_error", session: this.sessionId, err: e }, "heartbeat error");
+        }
       }
     }
   }
