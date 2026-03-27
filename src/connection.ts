@@ -194,7 +194,7 @@ export class WireConnection {
 
     if (this.stopped) return;
 
-    const interval = this.opts.heartbeatInterval ?? 20_000;
+    const interval = this.opts.heartbeatInterval ?? 10_000;
     this.heartbeatTimer = setInterval(() => {
       if (this.sessionId && this.signingKey)
         heartbeatHttp(
@@ -249,9 +249,9 @@ export class WireConnection {
     const id = this.opts.agentId;
     log(id, `RECV seq=${event.seq} topic=${event.topic} source=${event.source}`);
 
-    // Skip own messages
-    if (event.source === this.opts.agentId) {
-      log(id, `SKIP seq=${event.seq} (own message)`);
+    // Skip own messages on broadcast — but allow unicast to self
+    if (event.source === this.opts.agentId && event.dest !== this.opts.agentId) {
+      log(id, `SKIP seq=${event.seq} (own broadcast)`);
       this.ack(event.seq);
       return;
     }
