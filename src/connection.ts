@@ -326,9 +326,11 @@ export class WireConnection {
   // --- Heartbeat ---
 
   private async heartbeatLoop(intervalMs: number): Promise<void> {
+    this.log.info({ event: "heartbeat_loop_start", intervalMs }, "heartbeat loop started");
     while (!this.stopped) {
       await new Promise((r) => setTimeout(r, intervalMs));
       if (this.stopped) return;
+      this.log.info({ event: "heartbeat_tick", session: this.sessionId }, "heartbeat tick");
       if (this.sessionId && this.signingKey) {
         heartbeatHttp(
           this.opts.url,
