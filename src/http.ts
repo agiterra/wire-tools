@@ -85,7 +85,9 @@ export async function disconnect(
     method: "POST",
     headers: await signedHeaders(body, signingKey),
     body,
-  }).catch(() => {});
+  }).catch((e) => {
+    console.error(`[wire] disconnect failed: ${e instanceof Error ? e.message : e}`, e);
+  });
 }
 
 export async function ack(
@@ -120,5 +122,7 @@ export async function heartbeat(
       headers: await signedHeaders(body, signingKey),
       body,
     },
-  ).catch(() => {});
+  ).catch((e) => {
+    console.error(`[wire] heartbeat failed for ${agentId}/${sessionId}: ${e instanceof Error ? e.message : e}`, e);
+  });
 }

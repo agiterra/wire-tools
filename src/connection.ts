@@ -40,7 +40,9 @@ function formatError(e: unknown): string {
 
 function log(agentId: string, ...args: unknown[]): void {
   const line = `${new Date().toISOString()} [${agentId}] ${args.map(a => a instanceof Error ? formatError(a) : typeof a === "string" ? a : JSON.stringify(a)).join(" ")}\n`;
-  try { writeFileSync(WIRE_LOG, line, { flag: "a" }); } catch {}
+  try { writeFileSync(WIRE_LOG, line, { flag: "a" }); } catch (e) {
+    console.error(`[wire] failed to write log to ${WIRE_LOG}: ${e instanceof Error ? e.message : e}`);
+  }
 }
 
 export type { WireEvent };
@@ -446,7 +448,9 @@ export class WireConnection {
               pubB64,
               this.signingKey,
               this.opts.subscriptions,
-            ).catch(() => {});
+            ).catch((e) => {
+              log(this.opts.agentId, `REGISTER_RETRY_FAILED`, e);
+            });
           }
           // Don't create a new session — reuse the existing one.
           // streamOnce() will attempt to reconnect with the same sessionId.
