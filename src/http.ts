@@ -9,6 +9,9 @@
  */
 
 import { signBody } from "./crypto.js";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("wire-http");
 
 export type WireEvent = {
   seq: number;
@@ -86,7 +89,7 @@ export async function disconnect(
     headers: await signedHeaders(body, signingKey),
     body,
   }).catch((e) => {
-    console.error(`[wire] disconnect failed: ${e instanceof Error ? e.message : e}`, e);
+    log.error({ event: "disconnect_failed", agentId, sessionId, err: e }, "disconnect failed");
   });
 }
 
@@ -123,6 +126,6 @@ export async function heartbeat(
       body,
     },
   ).catch((e) => {
-    console.error(`[wire] heartbeat failed for ${agentId}/${sessionId}: ${e instanceof Error ? e.message : e}`, e);
+    log.error({ event: "heartbeat_failed", agentId, sessionId, err: e }, "heartbeat failed");
   });
 }
