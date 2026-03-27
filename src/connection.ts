@@ -94,7 +94,6 @@ export class WireConnection {
   private publicKey: string | null = null;
   private sessionId: string | null = null;
   private abortController: AbortController | null = null;
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
   private log: Logger;
 
@@ -182,35 +181,12 @@ export class WireConnection {
 
     if (this.stopped) return;
 
-    const interval = this.opts.heartbeatInterval ?? 10_000;
-    this.log.info({ event: "heartbeat_timer_start", interval }, "starting heartbeat timer");
-    // Canary: test if setInterval fires at all in this runtime
-    const canary = setInterval(() => {
-      this.log.info({ event: "canary_tick" }, "canary");
-      clearInterval(canary);
-    }, 3000);
-    this.heartbeatTimer = setInterval(() => {
-      if (this.sessionId && this.signingKey) {
-        heartbeatHttp(
-          this.opts.url,
-          this.opts.agentId,
-          this.sessionId,
-          this.signingKey,
-        );
-      } else {
-        this.log.warn({ event: "heartbeat_skip", hasSession: !!this.sessionId, hasKey: !!this.signingKey }, "heartbeat skipped — missing session or key");
-      }
-    }, interval);
-
+    this.heartbeatLoop(this.opts.heartbeatInterval ?? 10_000);
     this.streamLoop();
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
     this.abortController?.abort();
     if (this.sessionId && this.signingKey) {
       await disconnect(
@@ -345,6 +321,23 @@ export class WireConnection {
       return (event.payload as Record<string, unknown>).validator_result;
     }
     return undefined;
+  }
+
+  // --- Heartbeat ---
+
+  private async heartbeatLoop(intervalMs: number): Promise<void> {
+    while (!this.stopped) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+      if (this.stopped) return;
+      if (this.sessionId && this.signingKey) {
+        heartbeatHttp(
+          this.opts.url,
+          this.opts.agentId,
+          this.sessionId,
+          this.signingKey,
+        );
+      }
+    }
   }
 
   // --- SSE ---
