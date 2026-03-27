@@ -25,5 +25,5 @@ export function createLogger(
   } else {
     target = pino.destination(dest ?? 1);
   }
-  return pino({ name }, target);
+  return pino({ name, level: "info" }, target);
 }

@@ -219,7 +219,7 @@ export class WireConnection {
   // --- Inbound pipeline ---
 
   private async handleEvent(event: WireEvent): Promise<void> {
-    this.log.info({ event: "recv", seq: event.seq, topic: event.topic, source: event.source }, "RECV");
+    this.log.debug({ event: "recv", seq: event.seq, topic: event.topic, source: event.source }, "RECV");
 
     // Skip own messages on broadcast — but allow unicast to self
     if (event.source === this.opts.agentId && event.dest !== this.opts.agentId) {
@@ -237,12 +237,12 @@ export class WireConnection {
     if (handler) {
       const result = handler.process(event.payload, validatorResult);
       if (!result) {
-        this.log.info({ event: "rejected", seq: event.seq }, "REJECTED");
+        this.log.debug({ event: "rejected", seq: event.seq }, "REJECTED");
         this.ack(event.seq);
         return;
       }
       channelResult = result;
-      this.log.info({ event: "processed", seq: event.seq, text: channelResult.text.slice(0, 100) }, "PROCESSED");
+      this.log.debug({ event: "processed", seq: event.seq, text: channelResult.text.slice(0, 100) }, "PROCESSED");
     } else {
       // No handler — pass through raw payload as text
       channelResult = {
@@ -252,7 +252,7 @@ export class WireConnection {
             : JSON.stringify(event.payload),
         metadata: { source: event.source, topic: event.topic },
       };
-      this.log.info({ event: "passthrough", seq: event.seq, text: channelResult.text.slice(0, 100) }, "PASSTHROUGH");
+      this.log.debug({ event: "passthrough", seq: event.seq, text: channelResult.text.slice(0, 100) }, "PASSTHROUGH");
     }
 
     // 2. Run enrichment pipeline
@@ -274,10 +274,10 @@ export class WireConnection {
     }
 
     // 3. Deliver to adapter
-    this.log.info({ event: "deliver", seq: event.seq }, "DELIVER");
+    this.log.debug({ event: "deliver", seq: event.seq }, "DELIVER");
     try {
       await this.opts.deliver({ raw: event, channel: channelResult, enrichment });
-      this.log.info({ event: "deliver_ok", seq: event.seq }, "DELIVER_OK");
+      this.log.debug({ event: "deliver_ok", seq: event.seq }, "DELIVER_OK");
       this.ack(event.seq);
     } catch (e) {
       this.log.error({ event: "deliver_fail", seq: event.seq, err: e }, "DELIVER_FAIL");
@@ -326,7 +326,7 @@ export class WireConnection {
   // --- Heartbeat ---
 
   private async heartbeatLoop(intervalMs: number): Promise<void> {
-    this.log.info({ event: "heartbeat_loop_start", intervalMs }, "heartbeat loop started");
+    this.log.debug({ event: "heartbeat_loop_start", intervalMs }, "heartbeat loop started");
     while (!this.stopped) {
       await new Promise((r) => setTimeout(r, intervalMs));
       if (this.stopped) return;
@@ -338,7 +338,7 @@ export class WireConnection {
             this.sessionId,
             this.signingKey,
           );
-          this.log.info({ event: "heartbeat_ok", session: this.sessionId }, "heartbeat ok");
+          this.log.debug({ event: "heartbeat_ok", session: this.sessionId }, "heartbeat ok");
         } catch (e) {
           this.log.error({ event: "heartbeat_error", session: this.sessionId, err: e }, "heartbeat error");
         }
@@ -352,7 +352,7 @@ export class WireConnection {
   private lastEventId: string | null = null;
 
   private async streamOnce(): Promise<void> {
-    this.log.info({ event: "sse_connect", session: this.sessionId }, "SSE_CONNECT");
+    this.log.debug({ event: "sse_connect", session: this.sessionId }, "SSE_CONNECT");
     const streamUrl = `${this.opts.url}/agents/${this.opts.agentId}/stream?session_id=${this.sessionId}`;
     this.abortController = new AbortController();
     const headers: Record<string, string> = {
