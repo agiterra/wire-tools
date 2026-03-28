@@ -118,6 +118,23 @@ export async function ack(
   }
 }
 
+export async function setPlan(
+  url: string,
+  agentId: string,
+  plan: string,
+  signingKey: CryptoKey,
+): Promise<void> {
+  const body = JSON.stringify({ plan });
+  const res = await fetch(`${url}/agents/${agentId}/plan`, {
+    method: "PUT",
+    headers: await signedHeaders(body, signingKey),
+    body,
+  });
+  if (!res.ok) {
+    throw new Error(`Wire set_plan failed (${res.status}): ${await res.text()}`);
+  }
+}
+
 export async function heartbeat(
   url: string,
   agentId: string,
