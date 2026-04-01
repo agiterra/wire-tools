@@ -22,7 +22,7 @@ export function createWebhookChannelHandler(): ChannelHandler {
       }
 
       const envelope = payload as Record<string, unknown>;
-      const source = (envelope.from as string) ?? "unknown";
+      const source = (envelope.from as string) ?? (envelope.source as string) ?? "unknown";
       const metadata: Record<string, unknown> = {
         source,
         from_name: envelope.from_name ?? source,
