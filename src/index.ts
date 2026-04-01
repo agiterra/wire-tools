@@ -19,7 +19,7 @@ export { createWebhookChannelHandler } from "./webhook-channel-handler.js";
 export { createLogger, type Logger } from "./logger.js";
 
 // Low-level tools (for custom adapters or channel plugins)
-export { loadOrCreateKey, signBody, derivePublicKeyB64, type KeyPair } from "./crypto.js";
+export { loadOrCreateKey, generateKeyPair, exportPrivateKey, signBody, derivePublicKeyB64, type KeyPair } from "./crypto.js";
 export { register, connect, disconnect, ack, heartbeat, setPlan } from "./http.js";
 export { parseSSEChunk } from "./sse.js";
 export { retryWithBackoff } from "./reconnect.js";

@@ -48,6 +48,24 @@ export async function loadOrCreateKey(
   return { publicKey, privateKey: kp.privateKey };
 }
 
+/**
+ * Generate a new Ed25519 keypair. Returns public key (base64) and private key (CryptoKey).
+ * Pure function — no filesystem access.
+ */
+export async function generateKeyPair(): Promise<KeyPair> {
+  const kp = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const publicKey = await derivePublicKeyB64(kp.privateKey);
+  return { publicKey, privateKey: kp.privateKey };
+}
+
+/**
+ * Export a private key as base64 PKCS8 string.
+ */
+export async function exportPrivateKey(privateKey: CryptoKey): Promise<string> {
+  const pkcs8 = await crypto.subtle.exportKey("pkcs8", privateKey);
+  return Buffer.from(pkcs8).toString("base64");
+}
+
 export async function signBody(
   privateKey: CryptoKey,
   body: string,
