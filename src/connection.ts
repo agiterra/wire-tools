@@ -369,8 +369,8 @@ export class WireConnection {
       headers,
     });
     if (!res.ok || !res.body) {
-      // Session rejected (reaped or invalid) — clear so reconnect creates a new one
-      if (res.status === 403) {
+      // Session rejected or server restarted — clear so reconnect creates a new one
+      if (res.status === 403 || res.status === 404 || res.status >= 500) {
         this.sessionId = null;
         this.lastEventId = null;
       }
@@ -416,7 +416,9 @@ export class WireConnection {
       try {
         await this.streamOnce();
         if (this.stopped) return;
-        this.log.warn({ event: "sse_stream_exited" }, "streamOnce returned without error");
+        // Stream ended cleanly — server likely restarted. Clear session for fresh connect.
+        this.log.warn({ event: "sse_stream_exited" }, "stream ended, clearing session for reconnect");
+        this.sessionId = null;
         backoff = 1000;
       } catch (e) {
         if (this.stopped) return;
@@ -428,7 +430,12 @@ export class WireConnection {
 
       this.opts.onDisconnect?.();
       await new Promise((r) => setTimeout(r, backoff));
-      backoff = Math.min(backoff * 2, 30000);
+      // Exponential backoff up to 30s, then steady 15-minute interval
+      if (backoff < 30000) {
+        backoff = Math.min(backoff * 2, 30000);
+      } else {
+        backoff = 15 * 60 * 1000; // 15 minutes
+      }
       if (this.stopped) return;
 
       // Reconnect: keep existing sessionId — the server marks the session
