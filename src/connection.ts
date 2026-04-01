@@ -327,9 +327,24 @@ export class WireConnection {
 
   private async heartbeatLoop(intervalMs: number): Promise<void> {
     this.log.debug({ event: "heartbeat_loop_start", intervalMs }, "heartbeat loop started");
+    let lastTick = Date.now();
     while (!this.stopped) {
       await new Promise((r) => setTimeout(r, intervalMs));
       if (this.stopped) return;
+
+      const now = Date.now();
+      const elapsed = now - lastTick;
+      lastTick = now;
+
+      // Detect wake from sleep: if elapsed >> interval, we were suspended
+      if (elapsed > intervalMs * 3) {
+        this.log.info({ event: "wake_detected", elapsed, expected: intervalMs }, "wake from sleep detected, forcing reconnect");
+        // Abort current SSE stream — streamLoop will reconnect
+        this.abortController?.abort();
+        this.sessionId = null;
+        continue;
+      }
+
       if (this.sessionId && this.signingKey) {
         try {
           await heartbeatHttp(
