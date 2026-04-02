@@ -1,15 +1,15 @@
 /**
  * Stateless HTTP helpers for Wire REST API.
  *
- * All mutating endpoints require an Ed25519 signing key. The request body
- * is signed and sent via X-Wire-Signature header.
+ * All mutating endpoints use JWT Bearer auth (EdDSA/Ed25519).
+ * The JWT iss claim identifies the calling agent; body_hash ensures integrity.
  *
  * Core protocol operations only. IPC-specific helpers (webhook registration,
  * signed message sending) belong in @agiterra/wire-ipc.
  */
 
 import { join } from "path";
-import { signBody } from "./crypto.js";
+import { createAuthJwt } from "./crypto.js";
 import { createLogger } from "./logger.js";
 
 const WIRE_LOG = join(process.env.HOME ?? "/tmp", ".wire", "wire-connection.jsonl");
@@ -24,33 +24,34 @@ export type WireEvent = {
   created_at: number;
 };
 
-async function signedHeaders(
+async function jwtHeaders(
+  agentId: string,
   body: string,
   signingKey: CryptoKey,
 ): Promise<Record<string, string>> {
+  const token = await createAuthJwt(signingKey, agentId, body);
   return {
     "Content-Type": "application/json",
-    "X-Wire-Signature": await signBody(signingKey, body),
+    Authorization: `Bearer ${token}`,
   };
 }
 
 export async function register(
   url: string,
-  agentId: string,
+  callerAgentId: string,
+  newAgentId: string,
   displayName: string,
   publicKey: string,
   signingKey: CryptoKey,
-  subscriptions: string[] = ["*"],
 ): Promise<void> {
   const body = JSON.stringify({
-    id: agentId,
+    id: newAgentId,
     display_name: displayName,
     pubkey: publicKey,
-    subscriptions: subscriptions.map((topic) => ({ topic })),
   });
   const res = await fetch(`${url}/agents/register`, {
     method: "POST",
-    headers: await signedHeaders(body, signingKey),
+    headers: await jwtHeaders(callerAgentId, body, signingKey),
     body,
   });
   if (!res.ok) {
@@ -64,12 +65,12 @@ export async function connect(
   signingKey: CryptoKey,
   ccSessionId?: string,
 ): Promise<string> {
-  const payload: Record<string, string> = { agent_id: agentId };
+  const payload: Record<string, string> = {};
   if (ccSessionId) payload.cc_session_id = ccSessionId;
   const body = JSON.stringify(payload);
   const res = await fetch(`${url}/agents/connect`, {
     method: "POST",
-    headers: await signedHeaders(body, signingKey),
+    headers: await jwtHeaders(agentId, body, signingKey),
     body,
   });
   if (!res.ok) {
@@ -85,11 +86,11 @@ export async function disconnect(
   sessionId: string,
   signingKey: CryptoKey,
 ): Promise<void> {
-  const body = JSON.stringify({ session_id: sessionId, agent_id: agentId });
+  const body = JSON.stringify({ session_id: sessionId });
   try {
     const res = await fetch(`${url}/agents/disconnect`, {
       method: "POST",
-      headers: await signedHeaders(body, signingKey),
+      headers: await jwtHeaders(agentId, body, signingKey),
       body,
     });
     if (!res.ok) {
@@ -107,10 +108,10 @@ export async function ack(
   seq: number,
   signingKey: CryptoKey,
 ): Promise<void> {
-  const body = JSON.stringify({ session_id: sessionId, seq, agent_id: agentId });
+  const body = JSON.stringify({ session_id: sessionId, seq });
   const res = await fetch(`${url}/agents/ack`, {
     method: "POST",
-    headers: await signedHeaders(body, signingKey),
+    headers: await jwtHeaders(agentId, body, signingKey),
     body,
   });
   if (!res.ok) {
@@ -127,7 +128,7 @@ export async function setPlan(
   const body = JSON.stringify({ plan });
   const res = await fetch(`${url}/agents/${agentId}/plan`, {
     method: "PUT",
-    headers: await signedHeaders(body, signingKey),
+    headers: await jwtHeaders(agentId, body, signingKey),
     body,
   });
   if (!res.ok) {
@@ -141,13 +142,13 @@ export async function heartbeat(
   sessionId: string,
   signingKey: CryptoKey,
 ): Promise<void> {
-  const body = JSON.stringify({ agent_id: agentId, session_id: sessionId });
+  const body = "{}";
   try {
     const res = await fetch(
       `${url}/agents/${agentId}/sessions/${sessionId}/heartbeat`,
       {
         method: "POST",
-        headers: await signedHeaders(body, signingKey),
+        headers: await jwtHeaders(agentId, body, signingKey),
         body,
       },
     );

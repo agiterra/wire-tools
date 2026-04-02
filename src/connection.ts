@@ -13,7 +13,7 @@
 
 import { join } from "path";
 import { createLogger, type Logger } from "./logger.js";
-import { loadOrCreateKey, derivePublicKeyB64 } from "./crypto.js";
+import { derivePublicKeyB64 } from "./crypto.js";
 import {
   register,
   connect,
@@ -80,7 +80,7 @@ export type ConnectionOptions = {
   agentId: string;
   agentName: string;
   ccSessionId?: string; // Identifies the Claude Code session (survives SSE reconnects)
-  subscriptions?: string[];
+  keyPair: { publicKey: string; privateKey: CryptoKey }; // Caller provides the key
   heartbeatInterval?: number; // ms, default 20000
   deliver: DeliverFn;
   onError?: (error: unknown) => void;
@@ -148,19 +148,18 @@ export class WireConnection {
 
   async start(): Promise<void> {
     this.stopped = false;
-    const kp = await loadOrCreateKey(this.opts.agentId);
-    this.signingKey = kp.privateKey;
-    this.publicKey = kp.publicKey;
+    this.signingKey = this.opts.keyPair.privateKey;
+    this.publicKey = this.opts.keyPair.publicKey;
 
     await retryWithBackoff(
       async () => {
         await register(
           this.opts.url,
           this.opts.agentId,
+          this.opts.agentId,
           this.opts.agentName,
           this.publicKey!,
           this.signingKey!,
-          this.opts.subscriptions,
         );
         this.sessionId = await connect(
           this.opts.url,
@@ -464,10 +463,10 @@ export class WireConnection {
             await register(
               this.opts.url,
               this.opts.agentId,
+              this.opts.agentId,
               this.opts.agentName,
               pubB64,
               this.signingKey,
-              this.opts.subscriptions,
             ).catch((e) => {
               this.log.error({ event: "register_retry_failed", err: e }, "REGISTER_RETRY_FAILED");
             });

@@ -1,13 +1,10 @@
 /**
- * Ed25519 key management and signing for Wire agents.
+ * Ed25519 crypto primitives for Wire agents.
  *
- * Keys stored as PKCS8 (private) and raw base64 (public) at ~/.wire/keys/.
+ * Pure functions — no filesystem access. Keys are provided by the caller
+ * (from env vars, generated in memory, etc.).
  * Uses Web Crypto API — works in Node, Bun, and Deno.
  */
-
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { homedir } from "os";
-import { join } from "path";
 
 export type KeyPair = {
   publicKey: string; // base64-encoded raw Ed25519 public key (32 bytes)
@@ -23,30 +20,6 @@ export async function derivePublicKeyB64(
   return pubB64 + "=".repeat((4 - (pubB64.length % 4)) % 4);
 }
 
-export async function loadOrCreateKey(
-  agentId: string,
-  dir?: string,
-): Promise<KeyPair> {
-  const keyDir = dir ?? join(homedir(), ".wire", "keys");
-  const keyPath = join(keyDir, `${agentId}.key`);
-
-  if (existsSync(keyPath)) {
-    const pkcs8 = readFileSync(keyPath);
-    const privateKey = await crypto.subtle.importKey(
-      "pkcs8", pkcs8, "Ed25519", true, ["sign"],
-    );
-    return { publicKey: await derivePublicKeyB64(privateKey), privateKey };
-  }
-
-  const kp = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
-  const rawPub = await crypto.subtle.exportKey("raw", kp.publicKey);
-  const publicKey = Buffer.from(rawPub).toString("base64");
-  const pkcs8 = await crypto.subtle.exportKey("pkcs8", kp.privateKey);
-  mkdirSync(keyDir, { recursive: true });
-  writeFileSync(keyPath, Buffer.from(pkcs8), { mode: 0o600 });
-
-  return { publicKey, privateKey: kp.privateKey };
-}
 
 /**
  * Generate a new Ed25519 keypair. Returns public key (base64) and private key (CryptoKey).
@@ -73,4 +46,52 @@ export async function signBody(
   const data = new TextEncoder().encode(body);
   const sig = await crypto.subtle.sign("Ed25519", privateKey, data);
   return Buffer.from(sig).toString("base64");
+}
+
+// --- JWT auth for Wire REST API ---
+
+function base64urlEncode(data: Uint8Array): string {
+  let str = "";
+  for (const b of data) str += String.fromCharCode(b);
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const JWT_HEADER_B64 = base64urlEncode(
+  new TextEncoder().encode(JSON.stringify({ alg: "EdDSA", typ: "JWT" })),
+);
+
+export async function hashBody(body: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(body),
+  );
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Create a JWT for Wire REST API authentication.
+ * Claims: iss (agent ID), iat, body_hash (SHA-256 of request body).
+ */
+export async function createAuthJwt(
+  privateKey: CryptoKey,
+  agentId: string,
+  body: string,
+): Promise<string> {
+  const claims = {
+    iss: agentId,
+    iat: Math.floor(Date.now() / 1000),
+    body_hash: await hashBody(body),
+  };
+  const payloadB64 = base64urlEncode(
+    new TextEncoder().encode(JSON.stringify(claims)),
+  );
+  const signingInput = `${JWT_HEADER_B64}.${payloadB64}`;
+  const sig = await crypto.subtle.sign(
+    "Ed25519",
+    privateKey,
+    new TextEncoder().encode(signingInput),
+  );
+  return `${signingInput}.${base64urlEncode(new Uint8Array(sig))}`;
 }
