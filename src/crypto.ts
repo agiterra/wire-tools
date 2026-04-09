@@ -39,6 +39,23 @@ export async function exportPrivateKey(privateKey: CryptoKey): Promise<string> {
   return Buffer.from(pkcs8).toString("base64");
 }
 
+/**
+ * Import a private key from a base64 PKCS8 string (e.g. CREW_PRIVATE_KEY env var).
+ */
+export async function importPrivateKey(base64Pkcs8: string): Promise<CryptoKey> {
+  const pkcs8 = Uint8Array.from(atob(base64Pkcs8), (c) => c.charCodeAt(0));
+  return crypto.subtle.importKey("pkcs8", pkcs8, "Ed25519", true, ["sign"]);
+}
+
+/**
+ * Import a base64 PKCS8 private key and derive the full KeyPair.
+ */
+export async function importKeyPair(base64Pkcs8: string): Promise<KeyPair> {
+  const privateKey = await importPrivateKey(base64Pkcs8);
+  const publicKey = await derivePublicKeyB64(privateKey);
+  return { publicKey, privateKey };
+}
+
 export async function signBody(
   privateKey: CryptoKey,
   body: string,

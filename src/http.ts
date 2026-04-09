@@ -4,8 +4,7 @@
  * All mutating endpoints use JWT Bearer auth (EdDSA/Ed25519).
  * The JWT iss claim identifies the calling agent; body_hash ensures integrity.
  *
- * Core protocol operations only. IPC-specific helpers (webhook registration,
- * signed message sending) belong in @agiterra/wire-ipc.
+ * Core protocol operations + channel-agnostic message sending.
  */
 
 import { join } from "path";
@@ -160,4 +159,29 @@ export async function heartbeat(
   } catch (e) {
     log.error({ event: "heartbeat_failed", agentId, sessionId, err: e }, "heartbeat failed");
   }
+}
+
+/**
+ * Send a JWT-signed message to an agent via a Wire webhook channel.
+ * Channel-agnostic — the topic determines which plugin channel receives it.
+ */
+export async function sendSignedMessage(
+  url: string,
+  agentId: string,
+  signingKey: CryptoKey,
+  topic: string,
+  payload: unknown,
+  dest?: string,
+): Promise<{ seq: number }> {
+  const targetAgent = dest ?? agentId;
+  const body = JSON.stringify(payload);
+  const res = await fetch(`${url}/webhooks/${targetAgent}/${topic}`, {
+    method: "POST",
+    headers: await jwtHeaders(agentId, body, signingKey),
+    body,
+  });
+  if (!res.ok) {
+    throw new Error(`Wire send failed (${res.status}): ${await res.text()}`);
+  }
+  return (await res.json()) as { seq: number };
 }

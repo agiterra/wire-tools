@@ -1,6 +1,6 @@
 {
   "name": "@agiterra/wire-tools",
-  "version": "0.11.2",
+  "version": "0.12.0",
   "description": "Shared Wire primitives — crypto, HTTP helpers, SSE parsing, reconnect, connection. Used by server and adapters.",
   "type": "module",
   "main": "./src/index.ts",
