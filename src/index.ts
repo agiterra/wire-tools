@@ -23,3 +23,6 @@ export { generateKeyPair, exportPrivateKey, importPrivateKey, importKeyPair, sig
 export { register, connect, disconnect, ack, heartbeat, setPlan, sendSignedMessage } from "./http.js";
 export { parseSSEChunk } from "./sse.js";
 export { retryWithBackoff } from "./reconnect.js";
+
+// MCP server (shared by claude-code and codex adapters)
+export { startServer } from "./mcp-server.js";

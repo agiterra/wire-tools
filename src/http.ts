@@ -173,9 +173,11 @@ export async function sendSignedMessage(
   payload: unknown,
   dest?: string,
 ): Promise<{ seq: number }> {
-  const targetAgent = dest ?? agentId;
   const body = JSON.stringify(payload);
-  const res = await fetch(`${url}/webhooks/${targetAgent}/${topic}`, {
+  const endpoint = dest
+    ? `${url}/webhooks/${dest}/${topic}`
+    : `${url}/broadcast/${topic}`;
+  const res = await fetch(endpoint, {
     method: "POST",
     headers: await jwtHeaders(agentId, body, signingKey),
     body,

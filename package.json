@@ -21,6 +21,7 @@
   "license": "MIT",
   "author": "Tim Garthwaite <https://github.com/mividtim>",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "pino": "^10.3.1"
   }
 }
