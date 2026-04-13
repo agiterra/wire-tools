@@ -8,8 +8,8 @@
  *
  * Config env vars:
  *   WIRE_URL            default http://localhost:9800
- *   WIRE_AGENT_ID       required or auto-generated
- *   WIRE_AGENT_NAME     display name
+ *   AGENT_ID            required or auto-generated
+ *   AGENT_NAME           display name
  */
 
 import { writeFileSync, mkdirSync, unlinkSync } from "fs";
@@ -33,11 +33,11 @@ import {
 const log = createLogger("wire-cc", 2); // stderr — stdout is MCP transport
 
 const WIRE_URL = process.env.WIRE_URL ?? "http://localhost:9800";
-// CREW_AGENT_ID is set by crew launch and takes priority over .env's WIRE_AGENT_ID
+// AGENT_ID is the canonical identity env var — set by crew launch or .env
 const AGENT_ID =
-  process.env.CREW_AGENT_ID ?? process.env.WIRE_AGENT_ID ?? `claude-${crypto.randomUUID().slice(0, 8)}`;
+  process.env.AGENT_ID ?? `claude-${crypto.randomUUID().slice(0, 8)}`;
 const AGENT_NAME =
-  process.env.CREW_AGENT_NAME ?? process.env.WIRE_AGENT_NAME ?? AGENT_ID;
+  process.env.AGENT_NAME ?? AGENT_ID;
 // Claude Code session ID — injected by SessionStart hook, persists across MCP reconnects
 const CC_SESSION_ID = process.env.CLAUDE_CODE_SESSION_ID ?? crypto.randomUUID();
 
