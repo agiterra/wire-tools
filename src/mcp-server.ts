@@ -9,7 +9,9 @@
  * Config env vars:
  *   WIRE_URL            default http://localhost:9800
  *   AGENT_ID            required or auto-generated
- *   AGENT_NAME           display name
+ *   AGENT_NAME          display name
+ *   AGENT_PRIVATE_KEY   Ed25519 PKCS8 base64 (required)
+ *   AGENT_PLAN          optional initial plan published to the Wire dashboard at startup
  */
 
 import { writeFileSync, mkdirSync, unlinkSync } from "fs";
@@ -243,15 +245,12 @@ async function deliver(payload: DeliveryPayload): Promise<void> {
 // --- Main ---
 
 export async function startServer(): Promise<void> {
-  // Load agent key (base64 PKCS8). Crew-launched agents get their own key
-  // via CREW_PRIVATE_KEY which takes precedence over .env's WIRE_PRIVATE_KEY.
-  const rawKey = process.env.CREW_PRIVATE_KEY ?? process.env.WIRE_PRIVATE_KEY;
+  const rawKey = process.env.AGENT_PRIVATE_KEY;
   if (!rawKey) {
-    log.error({ event: "no_private_key" }, "no WIRE_PRIVATE_KEY or CREW_PRIVATE_KEY — exiting");
+    log.error({ event: "no_private_key" }, "AGENT_PRIVATE_KEY not set — exiting");
     process.exit(1);
-  } else {
-    keyPair = await importKeyPair(rawKey);
   }
+  keyPair = await importKeyPair(rawKey);
 
   // Connect MCP first so notifications work when SSE backlog arrives
   const transport = new StdioServerTransport();
@@ -297,6 +296,19 @@ export async function startServer(): Promise<void> {
   await new Promise((r) => setTimeout(r, 2000));
 
   await conn.start();
+
+  // Publish initial plan if the orchestrator provided one via env. This is the
+  // env-driven counterpart to the set_plan tool — lets a spawning agent
+  // pre-populate the dashboard without a separate round-trip after startup.
+  const initialPlan = process.env.AGENT_PLAN;
+  if (initialPlan) {
+    try {
+      await setPlan(WIRE_URL, AGENT_ID, initialPlan, keyPair.privateKey);
+      log.info({ event: "initial_plan_published" }, "AGENT_PLAN published");
+    } catch (e) {
+      log.error({ event: "initial_plan_failed", err: e }, "failed to publish AGENT_PLAN");
+    }
+  }
 
   const cleanup = async () => {
     try { unlinkSync(sessionFile); } catch {}
