@@ -40,7 +40,7 @@ export async function exportPrivateKey(privateKey: CryptoKey): Promise<string> {
 }
 
 /**
- * Import a private key from a base64 PKCS8 string (e.g. CREW_PRIVATE_KEY env var).
+ * Import a private key from a base64 PKCS8 string (e.g. AGENT_PRIVATE_KEY env var).
  */
 export async function importPrivateKey(base64Pkcs8: string): Promise<CryptoKey> {
   const pkcs8 = Uint8Array.from(atob(base64Pkcs8), (c) => c.charCodeAt(0));
