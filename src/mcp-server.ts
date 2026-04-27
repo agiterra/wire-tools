@@ -64,10 +64,60 @@ const mcp = new Server(
 
 let keyPair: KeyPair | null = null;
 
+/**
+ * Inbound delivery mode.
+ * - push: CC-style. Each event delivered via `notifications/claude/channel`.
+ * - poll: codex/other clients. Events buffered in memory; agent calls
+ *   `get_pending_messages` to drain. Default for any client whose name
+ *   doesn't contain "claude".
+ *
+ * Resolved lazily from `mcp.getClientVersion()` per-call. The SDK calls
+ * `oninitialized` AFTER sending the init response, which races with the
+ * client's first tools/list request — lazy resolution avoids the race.
+ */
+function isPollMode(): boolean {
+  const name = (mcp.getClientVersion()?.name ?? "").toLowerCase();
+  // Default to poll for unknowns: silent-drop on push is worse than an
+  // unfamiliar tool surface.
+  return !name.includes("claude");
+}
+
+type BufferedMessage = {
+  seq: number;
+  source: string;
+  topic: string;
+  content: string;
+  ts: string;
+  metadata: Record<string, unknown>;
+};
+const messageBuffer: BufferedMessage[] = [];
+const BUFFER_LIMIT = 200;
+
 // --- Tools ---
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    ...(isPollMode()
+      ? [{
+          name: "get_pending_messages",
+          description:
+            "Drain pending Wire messages received since the last call. " +
+            "Codex agents (and other clients without push notifications support) " +
+            "should call this periodically — every ~10–30s during active work, " +
+            "or on a heartbeat — to receive inbound IPC. " +
+            "Returns up to `limit` messages, ordered oldest-first. " +
+            "Empty array means no messages waiting.",
+          inputSchema: {
+            type: "object" as const,
+            properties: {
+              limit: {
+                type: "number",
+                description: "Max messages to return (default 50, cap 200).",
+              },
+            },
+          },
+        }]
+      : []),
     {
       name: "set_plan",
       description: "Update this agent's plan on the Wire dashboard",
@@ -122,6 +172,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (req.params.name === "get_pending_messages") {
+    const args = (req.params.arguments ?? {}) as { limit?: number };
+    const limit = Math.min(args.limit ?? 50, 200);
+    const drained = messageBuffer.splice(0, limit);
+    return {
+      content: [
+        { type: "text" as const, text: JSON.stringify({ count: drained.length, messages: drained }) },
+      ],
+    };
+  }
   if (req.params.name === "set_plan") {
     const { plan } = req.params.arguments as { plan: string };
     try {
@@ -214,8 +274,31 @@ function canonicalTopic(topic: string): string {
 async function deliver(payload: DeliveryPayload): Promise<void> {
   const { raw, channel } = payload;
   const source = (channel.metadata.source as string) ?? raw.source;
-
   const content = channel.text;
+  const topic = canonicalTopic(raw.topic);
+  const ts = new Date(raw.created_at).toISOString();
+
+  if (isPollMode()) {
+    // Buffer for codex/non-CC clients. The connection ack-after-deliver
+    // semantics still apply: returning successfully here advances the
+    // server cursor, so the BUFFER_LIMIT drop is a real loss if the
+    // agent doesn't pull in time. Documented tradeoff for v1.
+    if (messageBuffer.length >= BUFFER_LIMIT) {
+      // Drop oldest to make room. Logged loudly so the symptom is visible.
+      const dropped = messageBuffer.shift();
+      log.warn({ event: "buffer_overflow", droppedSeq: dropped?.seq, limit: BUFFER_LIMIT }, "buffer full — dropped oldest");
+    }
+    messageBuffer.push({
+      seq: raw.seq,
+      source: String(raw.source),
+      topic,
+      content,
+      ts,
+      metadata: channel.metadata as Record<string, unknown>,
+    });
+    log.info({ event: "deliver_buffered", seq: raw.seq, source, depth: messageBuffer.length }, "buffered for poll");
+    return;
+  }
 
   try {
     const notification = {
@@ -226,10 +309,10 @@ async function deliver(payload: DeliveryPayload): Promise<void> {
           chat_id: `wire:${source}`,
           message_id: String(raw.seq),
           user: source,
-          ts: new Date(raw.created_at).toISOString(),
+          ts,
           seq: String(raw.seq),
           source: String(raw.source),
-          topic: canonicalTopic(raw.topic),
+          topic,
           created_at: String(raw.created_at),
         },
       },
