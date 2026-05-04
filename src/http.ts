@@ -42,11 +42,13 @@ export async function register(
   displayName: string,
   publicKey: string,
   signingKey: CryptoKey,
+  options?: { force_rotate?: boolean },
 ): Promise<void> {
   const body = JSON.stringify({
     id: newAgentId,
     display_name: displayName,
     pubkey: publicKey,
+    ...(options?.force_rotate ? { force_rotate: true } : {}),
   });
   const res = await fetch(`${url}/agents/register`, {
     method: "POST",

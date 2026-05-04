@@ -97,6 +97,13 @@ export class WireConnection {
   private stopped = false;
   private log: Logger;
 
+  // Give-up gate: if the server keeps rejecting register/connect with 401/403
+  // (e.g. our key was rotated out from under us by a sponsor's register_agent
+  // call), retrying forever zombies the process. Count consecutive auth
+  // failures and exit so the orphan-reaper can clean up.
+  private consecutiveAuthFailures = 0;
+  private static readonly MAX_CONSECUTIVE_AUTH_FAILURES = 10;
+
   // Channel handler registry: topic pattern → handler
   private channelHandlers = new Map<string, ChannelHandler>();
 
@@ -161,6 +168,7 @@ export class WireConnection {
           this.publicKey!,
           this.signingKey!,
         );
+        this.consecutiveAuthFailures = 0;
         this.sessionId = await connect(
           this.opts.url,
           this.opts.agentId,
@@ -171,10 +179,12 @@ export class WireConnection {
       },
       {
         shouldStop: () => this.stopped,
-        onError: (e, ms) =>
+        onError: (e, ms) => {
+          this.maybeGiveUp(e);
           this.opts.onError?.(
             new Error(`Wire startup failed: ${e}; retrying in ${ms}ms`),
-          ),
+          );
+        },
       },
     );
 
@@ -322,6 +332,38 @@ export class WireConnection {
     return undefined;
   }
 
+  // --- Auth-failure give-up gate ---
+
+  /**
+   * Increment the consecutive-auth-failure counter when an error looks like a
+   * 401/403 from the Wire server. If we cross the threshold, exit the process
+   * so the orphan-reaper can clean up — retrying forever zombies the agent and
+   * generates 30s-cadence log spam (observed 2026-05-01: Eclair PID 1150 spent
+   * 15+ min in register_retry_failed after a sponsor's register_agent rotated
+   * her key out from under her in-memory signing key).
+   *
+   * Non-auth errors (network blips, 5xx) reset the counter — those are
+   * transient and should not trigger give-up.
+   */
+  private maybeGiveUp(err: unknown): void {
+    const msg = err instanceof Error ? err.message : String(err);
+    const isAuthFailure = /\((401|403)\)/.test(msg);
+    if (!isAuthFailure) {
+      this.consecutiveAuthFailures = 0;
+      return;
+    }
+    this.consecutiveAuthFailures += 1;
+    if (this.consecutiveAuthFailures >= WireConnection.MAX_CONSECUTIVE_AUTH_FAILURES) {
+      this.log.fatal(
+        { event: "auth_give_up", consecutive: this.consecutiveAuthFailures, lastErr: msg },
+        "Wire rejected register/connect with 401/403 too many times — exiting so the orphan-reaper can clean up",
+      );
+      // Exit synchronously: the parent CC process or orphan-reaper will respawn
+      // us cleanly with a fresh identity.
+      process.exit(1);
+    }
+  }
+
   // --- Heartbeat ---
 
   private async heartbeatLoop(intervalMs: number): Promise<void> {
@@ -467,9 +509,13 @@ export class WireConnection {
               this.opts.agentName,
               pubB64,
               this.signingKey,
-            ).catch((e) => {
-              this.log.error({ event: "register_retry_failed", err: e }, "REGISTER_RETRY_FAILED");
-            });
+            ).then(
+              () => { this.consecutiveAuthFailures = 0; },
+              (e) => {
+                this.log.error({ event: "register_retry_failed", err: e }, "REGISTER_RETRY_FAILED");
+                this.maybeGiveUp(e);
+              },
+            );
           }
           // Don't create a new session — reuse the existing one.
           // streamOnce() will attempt to reconnect with the same sessionId.
