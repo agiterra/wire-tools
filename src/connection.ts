@@ -104,6 +104,16 @@ export class WireConnection {
   private consecutiveAuthFailures = 0;
   private static readonly MAX_CONSECUTIVE_AUTH_FAILURES = 10;
 
+  // True only while we're actively reading from a live SSE stream. Heartbeat
+  // is gated on this — if the stream is broken, we let heartbeat lapse so the
+  // server's last_heartbeat goes stale and the dashboard reflects the real
+  // (un-deliverable) state. Without this gate, heartbeatLoop and streamLoop
+  // run independently: heartbeat keeps the agent looking online while messages
+  // route to dead SSE writers (observed 2026-05-06: Brioche heartbeating fine
+  // but stuck in streamLoop backoff after an ngrok blip; Mille-Feuille's
+  // unicasts hit forward_no_peer because emitter.emit returned false).
+  private streamLive = false;
+
   // Channel handler registry: topic pattern → handler
   private channelHandlers = new Map<string, ChannelHandler>();
 
@@ -386,7 +396,11 @@ export class WireConnection {
         continue;
       }
 
-      if (this.sessionId && this.signingKey) {
+      // Heartbeat only when the SSE stream is actually live. If the stream is
+      // broken (network error, ngrok blip, server restart), let the server's
+      // last_heartbeat go stale so the dashboard reflects un-deliverability.
+      // streamLoop will reconnect; heartbeat resumes when streamOnce succeeds.
+      if (this.sessionId && this.signingKey && this.streamLive) {
         try {
           await heartbeatHttp(
             this.opts.url,
@@ -398,6 +412,8 @@ export class WireConnection {
         } catch (e) {
           this.log.error({ event: "heartbeat_error", session: this.sessionId, err: e }, "heartbeat error");
         }
+      } else if (this.sessionId && !this.streamLive) {
+        this.log.debug({ event: "heartbeat_skipped_stream_dead", session: this.sessionId }, "heartbeat skipped — stream not live");
       }
     }
   }
@@ -437,6 +453,10 @@ export class WireConnection {
     const decoder = new TextDecoder();
     let buf = "";
 
+    // Stream is live the moment we have a reader. heartbeatLoop is gated on
+    // this flag; clear it on any exit (clean end, error, abort).
+    this.streamLive = true;
+
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -461,6 +481,7 @@ export class WireConnection {
         }
       }
     } finally {
+      this.streamLive = false;
       this.abortController = null;
       reader.releaseLock();
     }
@@ -486,12 +507,13 @@ export class WireConnection {
 
       this.opts.onDisconnect?.();
       await new Promise((r) => setTimeout(r, backoff));
-      // Exponential backoff up to 30s, then steady 15-minute interval
-      if (backoff < 30000) {
-        backoff = Math.min(backoff * 2, 30000);
-      } else {
-        backoff = 15 * 60 * 1000; // 15 minutes
-      }
+      // Exponential backoff capped at 30s. The previous design jumped to a
+      // 15-minute steady-state after exhausting fast retries, which made
+      // recovery from transient outages (e.g. a 30-second ngrok blip) take
+      // 15+ minutes. With heartbeat now gated on streamLive, lapsed heartbeat
+      // already signals un-deliverability to the server — there's no need to
+      // throttle reconnect attempts so aggressively.
+      backoff = Math.min(backoff * 2, 30000);
       if (this.stopped) return;
 
       // Reconnect: keep existing sessionId — the server marks the session
