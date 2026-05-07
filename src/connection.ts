@@ -6,6 +6,20 @@
  *
  *   SSE event → channel handler → enrichment pipeline → deliver
  *
+ * Architecture (v2.3.1+):
+ *
+ *   [Worker thread]                     [Main thread]
+ *   sse-worker.ts                       WireConnection
+ *   - register / connect                - heartbeatLoop (timer queue is
+ *   - streaming fetch (SSE)               not starved by streaming fetch)
+ *   - parseSSE                          - channel handlers
+ *   - reconnect / backoff               - enrichment pipelines
+ *                                       - send_message / set_plan / ack HTTP
+ *
+ *   ⇄ postMessage protocol:
+ *     main → worker: {type:"boot"|"stop", ...}
+ *     worker → main: {type:"stream_live"|"stream_dead"|"event"|"give_up"|"log"}
+ *
  * Adapter authors use this as their main interface. Channel plugins
  * (IPC, Slack, etc.) register handlers. Enrichment stages are configured
  * by the agent.
@@ -13,17 +27,12 @@
 
 import { join } from "path";
 import { createLogger, type Logger } from "./logger.js";
-import { derivePublicKeyB64 } from "./crypto.js";
+import { exportPrivateKey } from "./crypto.js";
 import {
-  register,
-  connect,
-  disconnect,
   ack as ackHttp,
   heartbeat as heartbeatHttp,
   type WireEvent,
 } from "./http.js";
-import { parseSSEChunk } from "./sse.js";
-import { retryWithBackoff } from "./reconnect.js";
 
 const WIRE_LOG = join(process.env.HOME ?? "/tmp", ".wire", "wire-connection.jsonl");
 
@@ -81,38 +90,33 @@ export type ConnectionOptions = {
   agentName: string;
   ccSessionId?: string; // Identifies the Claude Code session (survives SSE reconnects)
   keyPair: { publicKey: string; privateKey: CryptoKey }; // Caller provides the key
-  heartbeatInterval?: number; // ms, default 20000
+  heartbeatInterval?: number; // ms, default 10000
   deliver: DeliverFn;
   onError?: (error: unknown) => void;
   onConnect?: (sessionId: string) => void;
   onDisconnect?: () => void;
 };
 
+// --- Worker protocol types ---
+
+type WorkerToMainMsg =
+  | { type: "stream_live"; sessionId: string }
+  | { type: "stream_dead"; reason?: string }
+  | { type: "event"; event: WireEvent }
+  | { type: "give_up"; reason: string }
+  | { type: "log"; level: "debug" | "info" | "warn" | "error" | "fatal"; fields: Record<string, unknown>; msg: string };
+
 export class WireConnection {
   private opts: ConnectionOptions;
   private signingKey: CryptoKey | null = null;
-  private publicKey: string | null = null;
   private sessionId: string | null = null;
-  private abortController: AbortController | null = null;
+  private streamLive = false;
   private stopped = false;
   private log: Logger;
 
-  // Give-up gate: if the server keeps rejecting register/connect with 401/403
-  // (e.g. our key was rotated out from under us by a sponsor's register_agent
-  // call), retrying forever zombies the process. Count consecutive auth
-  // failures and exit so the orphan-reaper can clean up.
-  private consecutiveAuthFailures = 0;
-  private static readonly MAX_CONSECUTIVE_AUTH_FAILURES = 10;
-
-  // True only while we're actively reading from a live SSE stream. Heartbeat
-  // is gated on this — if the stream is broken, we let heartbeat lapse so the
-  // server's last_heartbeat goes stale and the dashboard reflects the real
-  // (un-deliverable) state. Without this gate, heartbeatLoop and streamLoop
-  // run independently: heartbeat keeps the agent looking online while messages
-  // route to dead SSE writers (observed 2026-05-06: Brioche heartbeating fine
-  // but stuck in streamLoop backoff after an ngrok blip; Mille-Feuille's
-  // unicasts hit forward_no_peer because emitter.emit returned false).
-  private streamLive = false;
+  private worker: Worker | null = null;
+  private bootResolve: ((sessionId: string) => void) | null = null;
+  private bootReject: ((err: Error) => void) | null = null;
 
   // Channel handler registry: topic pattern → handler
   private channelHandlers = new Map<string, ChannelHandler>();
@@ -166,55 +170,100 @@ export class WireConnection {
   async start(): Promise<void> {
     this.stopped = false;
     this.signingKey = this.opts.keyPair.privateKey;
-    this.publicKey = this.opts.keyPair.publicKey;
 
-    await retryWithBackoff(
-      async () => {
-        await register(
-          this.opts.url,
-          this.opts.agentId,
-          this.opts.agentId,
-          this.opts.agentName,
-          this.publicKey!,
-          this.signingKey!,
-        );
-        this.consecutiveAuthFailures = 0;
-        this.sessionId = await connect(
-          this.opts.url,
-          this.opts.agentId,
-          this.signingKey!,
-          this.opts.ccSessionId,
-        );
-        this.opts.onConnect?.(this.sessionId!);
-      },
-      {
-        shouldStop: () => this.stopped,
-        onError: (e, ms) => {
-          this.maybeGiveUp(e);
-          this.opts.onError?.(
-            new Error(`Wire startup failed: ${e}; retrying in ${ms}ms`),
-          );
-        },
-      },
-    );
+    // The streaming fetch lives in a worker so it can't starve our timer
+    // queue (heartbeats, MCP dispatch, etc.). We pass the private key as
+    // PKCS8 base64 since CryptoKey is not structuredClone-able.
+    const privateKeyB64 = await exportPrivateKey(this.signingKey);
 
-    if (this.stopped) return;
+    this.worker = new Worker(new URL("./sse-worker.ts", import.meta.url).href);
+    this.worker.onmessage = (ev: MessageEvent<WorkerToMainMsg>) => this.handleWorkerMessage(ev.data);
+    this.worker.onerror = (ev: ErrorEvent) => {
+      this.log.error({ event: "worker_error", message: ev.message, filename: ev.filename, lineno: ev.lineno }, "WORKER_ERROR");
+      this.opts.onError?.(new Error(`SSE worker error: ${ev.message}`));
+    };
 
+    // Boot promise: resolves on first stream_live, rejects on give_up.
+    const bootDone = new Promise<string>((resolve, reject) => {
+      this.bootResolve = resolve;
+      this.bootReject = reject;
+    });
+
+    this.worker.postMessage({
+      type: "boot",
+      url: this.opts.url,
+      agentId: this.opts.agentId,
+      agentName: this.opts.agentName,
+      ccSessionId: this.opts.ccSessionId,
+      privateKeyB64,
+    });
+
+    await bootDone;
+
+    // Heartbeat lives on the main thread now. Its setTimeout queue is no
+    // longer starved by streaming fetch in this thread, so it ticks reliably
+    // every intervalMs.
     this.heartbeatLoop(this.opts.heartbeatInterval ?? 10_000);
-    this.streamLoop();
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
-    this.abortController?.abort();
-    if (this.sessionId && this.signingKey) {
-      await disconnect(
-        this.opts.url,
-        this.opts.agentId,
-        this.sessionId,
-        this.signingKey,
-      );
-      this.sessionId = null;
+    if (this.worker) {
+      this.worker.postMessage({ type: "stop" });
+      // Give worker a moment to send disconnect HTTP and exit cleanly.
+      await new Promise((r) => setTimeout(r, 500));
+      this.worker.terminate();
+      this.worker = null;
+    }
+    this.streamLive = false;
+    this.sessionId = null;
+  }
+
+  // --- Worker message dispatch ---
+
+  private handleWorkerMessage(msg: WorkerToMainMsg): void {
+    switch (msg.type) {
+      case "stream_live": {
+        const wasFirstConnect = this.bootResolve != null;
+        this.sessionId = msg.sessionId;
+        this.streamLive = true;
+        if (this.bootResolve) {
+          this.bootResolve(msg.sessionId);
+          this.bootResolve = null;
+          this.bootReject = null;
+        }
+        if (!wasFirstConnect) {
+          this.log.info({ event: "stream_live", session: msg.sessionId }, "stream live (reconnected)");
+        }
+        this.opts.onConnect?.(msg.sessionId);
+        break;
+      }
+      case "stream_dead": {
+        this.streamLive = false;
+        this.opts.onDisconnect?.();
+        break;
+      }
+      case "event": {
+        void this.handleEvent(msg.event);
+        break;
+      }
+      case "give_up": {
+        this.log.fatal({ event: "auth_give_up", reason: msg.reason }, "Wire rejected register/connect repeatedly — exiting");
+        if (this.bootReject) {
+          this.bootReject(new Error(`Wire give_up: ${msg.reason}`));
+          this.bootResolve = null;
+          this.bootReject = null;
+        }
+        // The orphan-reaper will clean us up; our parent CC will respawn cleanly.
+        process.exit(1);
+        break;
+      }
+      case "log": {
+        const fn = (this.log as unknown as Record<string, (f: unknown, m: string) => void>)[msg.level]
+          ?? this.log.info.bind(this.log);
+        fn.call(this.log, msg.fields, msg.msg);
+        break;
+      }
     }
   }
 
@@ -342,64 +391,20 @@ export class WireConnection {
     return undefined;
   }
 
-  // --- Auth-failure give-up gate ---
-
-  /**
-   * Increment the consecutive-auth-failure counter when an error looks like a
-   * 401/403 from the Wire server. If we cross the threshold, exit the process
-   * so the orphan-reaper can clean up — retrying forever zombies the agent and
-   * generates 30s-cadence log spam (observed 2026-05-01: Eclair PID 1150 spent
-   * 15+ min in register_retry_failed after a sponsor's register_agent rotated
-   * her key out from under her in-memory signing key).
-   *
-   * Non-auth errors (network blips, 5xx) reset the counter — those are
-   * transient and should not trigger give-up.
-   */
-  private maybeGiveUp(err: unknown): void {
-    const msg = err instanceof Error ? err.message : String(err);
-    const isAuthFailure = /\((401|403)\)/.test(msg);
-    if (!isAuthFailure) {
-      this.consecutiveAuthFailures = 0;
-      return;
-    }
-    this.consecutiveAuthFailures += 1;
-    if (this.consecutiveAuthFailures >= WireConnection.MAX_CONSECUTIVE_AUTH_FAILURES) {
-      this.log.fatal(
-        { event: "auth_give_up", consecutive: this.consecutiveAuthFailures, lastErr: msg },
-        "Wire rejected register/connect with 401/403 too many times — exiting so the orphan-reaper can clean up",
-      );
-      // Exit synchronously: the parent CC process or orphan-reaper will respawn
-      // us cleanly with a fresh identity.
-      process.exit(1);
-    }
-  }
-
-  // --- Heartbeat ---
+  // --- Heartbeat (main thread, isolated from streaming fetch) ---
 
   private async heartbeatLoop(intervalMs: number): Promise<void> {
     this.log.debug({ event: "heartbeat_loop_start", intervalMs }, "heartbeat loop started");
-    let lastTick = Date.now();
     while (!this.stopped) {
       await new Promise((r) => setTimeout(r, intervalMs));
       if (this.stopped) return;
 
-      const now = Date.now();
-      const elapsed = now - lastTick;
-      lastTick = now;
-
-      // Detect wake from sleep: if elapsed >> interval, we were suspended
-      if (elapsed > intervalMs * 3) {
-        this.log.info({ event: "wake_detected", elapsed, expected: intervalMs }, "wake from sleep detected, forcing reconnect");
-        // Abort current SSE stream — streamLoop will reconnect
-        this.abortController?.abort();
-        this.sessionId = null;
-        continue;
-      }
-
-      // Heartbeat only when the SSE stream is actually live. If the stream is
-      // broken (network error, ngrok blip, server restart), let the server's
-      // last_heartbeat go stale so the dashboard reflects un-deliverability.
-      // streamLoop will reconnect; heartbeat resumes when streamOnce succeeds.
+      // Heartbeat only when the worker reports the SSE stream is live.
+      // If the stream is broken (network blip, server restart, worker is in
+      // backoff), we let last_heartbeat go stale on the server side so the
+      // dashboard reflects un-deliverability honestly. When the worker
+      // reconnects and posts stream_live, heartbeat resumes — server's
+      // clearReap fires on the next tick and the agent goes green again.
       if (this.sessionId && this.signingKey && this.streamLive) {
         try {
           await heartbeatHttp(
@@ -412,158 +417,7 @@ export class WireConnection {
         } catch (e) {
           this.log.error({ event: "heartbeat_error", session: this.sessionId, err: e }, "heartbeat error");
         }
-      } else if (this.sessionId && !this.streamLive) {
-        this.log.debug({ event: "heartbeat_skipped_stream_dead", session: this.sessionId }, "heartbeat skipped — stream not live");
       }
-    }
-  }
-
-  // --- SSE ---
-
-  // Track last event ID for reconnect (SSE spec Last-Event-ID)
-  private lastEventId: string | null = null;
-
-  private async streamOnce(): Promise<void> {
-    this.log.debug({ event: "sse_connect", session: this.sessionId }, "SSE_CONNECT");
-    const streamUrl = `${this.opts.url}/agents/${this.opts.agentId}/stream?session_id=${this.sessionId}`;
-    this.abortController = new AbortController();
-    const headers: Record<string, string> = {
-      Accept: "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    };
-    // Send Last-Event-ID on reconnect so server can resume from where we left off
-    if (this.lastEventId) {
-      headers["Last-Event-ID"] = this.lastEventId;
-    }
-    const res = await fetch(streamUrl, {
-      signal: this.abortController.signal,
-      headers,
-    });
-    if (!res.ok || !res.body) {
-      // Session rejected or server restarted — clear so reconnect creates a new one
-      if (res.status === 403 || res.status === 404 || res.status >= 500) {
-        this.sessionId = null;
-        this.lastEventId = null;
-      }
-      throw new Error(`SSE failed (${res.status})`);
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-
-    // Stream is live the moment we have a reader. heartbeatLoop is gated on
-    // this flag; clear it on any exit (clean end, error, abort).
-    this.streamLive = true;
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          this.log.warn({ event: "sse_stream_ended", session: this.sessionId }, "SSE stream reader returned done=true");
-          break;
-        }
-        buf += decoder.decode(value, { stream: true });
-        const { events, remaining } = parseSSEChunk(buf);
-        buf = remaining;
-        for (const sseEvent of events) {
-          // Track last event ID for reconnect
-          if (sseEvent.id) {
-            this.lastEventId = sseEvent.id;
-          }
-          try {
-            const event = JSON.parse(sseEvent.data) as WireEvent;
-            await this.handleEvent(event);
-          } catch (e) {
-            this.log.error({ event: "sse_parse_error", data: sseEvent.data?.slice(0, 200), err: e }, "SSE_PARSE_ERROR");
-          }
-        }
-      }
-    } finally {
-      this.streamLive = false;
-      this.abortController = null;
-      reader.releaseLock();
-    }
-  }
-
-  private async streamLoop(): Promise<void> {
-    let backoff = 1000;
-    while (!this.stopped) {
-      try {
-        await this.streamOnce();
-        if (this.stopped) return;
-        // Stream ended cleanly — server likely restarted. Clear session for fresh connect.
-        this.log.warn({ event: "sse_stream_exited" }, "stream ended, clearing session for reconnect");
-        this.sessionId = null;
-        backoff = 1000;
-      } catch (e) {
-        if (this.stopped) return;
-        this.log.error({ event: "sse_error", err: e, backoff }, "SSE error, reconnecting");
-        this.opts.onError?.(
-          new Error(`Wire SSE error: ${e}; retrying in ${backoff}ms`),
-        );
-      }
-
-      this.opts.onDisconnect?.();
-      await new Promise((r) => setTimeout(r, backoff));
-      // Exponential backoff capped at 30s. The previous design jumped to a
-      // 15-minute steady-state after exhausting fast retries, which made
-      // recovery from transient outages (e.g. a 30-second ngrok blip) take
-      // 15+ minutes. With heartbeat now gated on streamLive, lapsed heartbeat
-      // already signals un-deliverability to the server — there's no need to
-      // throttle reconnect attempts so aggressively.
-      backoff = Math.min(backoff * 2, 30000);
-      if (this.stopped) return;
-
-      // Reconnect: keep existing sessionId — the server marks the session
-      // stale on SSE abort but doesn't destroy it. When we re-open the SSE
-      // stream with the same session_id, the server resurrects it and replays
-      // from our cursor. Only create a new session if the stream fails (403).
-      await retryWithBackoff(
-        async () => {
-          if (this.signingKey) {
-            const pubB64 = await derivePublicKeyB64(this.signingKey);
-            await register(
-              this.opts.url,
-              this.opts.agentId,
-              this.opts.agentId,
-              this.opts.agentName,
-              pubB64,
-              this.signingKey,
-            ).then(
-              () => { this.consecutiveAuthFailures = 0; },
-              (e) => {
-                this.log.error({ event: "register_retry_failed", err: e }, "REGISTER_RETRY_FAILED");
-                this.maybeGiveUp(e);
-              },
-            );
-          }
-          // Don't create a new session — reuse the existing one.
-          // streamOnce() will attempt to reconnect with the same sessionId.
-          // If the server rejects it (session reaped), streamOnce throws and
-          // we'll create a new session on the next retry.
-          if (!this.sessionId) {
-            this.sessionId = await connect(
-              this.opts.url,
-              this.opts.agentId,
-              this.signingKey!,
-              this.opts.ccSessionId,
-            );
-            this.opts.onConnect?.(this.sessionId!);
-          }
-        },
-        {
-          shouldStop: () => this.stopped,
-          onError: (e, ms) =>
-            this.opts.onError?.(
-              new Error(
-                `Wire reconnect failed: ${e}; retrying in ${ms}ms`,
-              ),
-            ),
-        },
-      );
-      backoff = 1000;
     }
   }
 }
