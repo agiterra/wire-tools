@@ -14,6 +14,7 @@
  *
  * Protocol:
  *   main → worker: {type:"boot", url, agentId, agentName, ccSessionId?, privateKeyB64}
+ *   main → worker: {type:"reset"}  // heartbeat saw 403/404 — abort + new session
  *   main → worker: {type:"stop"}
  *
  *   worker → main: {type:"stream_live", sessionId}
@@ -228,6 +229,15 @@ self.onmessage = (ev) => {
       log("fatal", { event: "worker_boot_fatal", err: stringifyErr(e) }, "worker boot crashed");
       post({ type: "give_up", reason: stringifyErr(e) });
     });
+  } else if (data?.type === "reset") {
+    // Main thread saw heartbeat fail with 403/404 — our session is stale.
+    // Abort the current SSE read (which is likely hung on a zombie TCP
+    // socket) and clear sessionId so streamLoop's next iteration calls
+    // connect() to create a fresh session.
+    log("warn", { event: "sse_reset_requested", session: sessionId }, "main signaled session reset");
+    sessionId = null;
+    lastEventId = null;
+    abortController?.abort();
   } else if (data?.type === "stop") {
     stopped = true;
     abortController?.abort();

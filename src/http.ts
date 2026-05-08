@@ -137,12 +137,16 @@ export async function setPlan(
   }
 }
 
+export type HeartbeatResult =
+  | { ok: true }
+  | { ok: false; sessionInvalid: boolean; status?: number; err?: unknown };
+
 export async function heartbeat(
   url: string,
   agentId: string,
   sessionId: string,
   signingKey: CryptoKey,
-): Promise<void> {
+): Promise<HeartbeatResult> {
   const body = "{}";
   try {
     const res = await fetch(
@@ -155,11 +159,18 @@ export async function heartbeat(
     );
     if (!res.ok) {
       log.error({ event: "heartbeat_rejected", agentId, sessionId, status: res.status }, "heartbeat rejected");
-    } else {
-      log.debug({ event: "heartbeat_ok", agentId, sessionId }, "heartbeat ok");
+      // 403 (session does not belong to agent) and 404 (agent or session not
+      // found) both mean our local sessionId is stale — server purged the
+      // session row but we kept using it. Caller must trigger a reconnect.
+      const sessionInvalid = res.status === 403 || res.status === 404;
+      return { ok: false, sessionInvalid, status: res.status };
     }
+    log.debug({ event: "heartbeat_ok", agentId, sessionId }, "heartbeat ok");
+    return { ok: true };
   } catch (e) {
     log.error({ event: "heartbeat_failed", agentId, sessionId, err: e }, "heartbeat failed");
+    // Network/transport errors are not session-invalid — they're transient.
+    return { ok: false, sessionInvalid: false, err: e };
   }
 }
 

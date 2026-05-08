@@ -406,16 +406,32 @@ export class WireConnection {
       // reconnects and posts stream_live, heartbeat resumes — server's
       // clearReap fires on the next tick and the agent goes green again.
       if (this.sessionId && this.signingKey && this.streamLive) {
-        try {
-          await heartbeatHttp(
-            this.opts.url,
-            this.opts.agentId,
-            this.sessionId,
-            this.signingKey,
-          );
+        const result = await heartbeatHttp(
+          this.opts.url,
+          this.opts.agentId,
+          this.sessionId,
+          this.signingKey,
+        );
+        if (result.ok) {
           this.log.debug({ event: "heartbeat_ok", session: this.sessionId }, "heartbeat ok");
-        } catch (e) {
-          this.log.error({ event: "heartbeat_error", session: this.sessionId, err: e }, "heartbeat error");
+        } else if (result.sessionInvalid) {
+          // Server purged our session (typical after a sleep/wake or any long
+          // disconnect: SSE reader hangs on a zombie TCP socket while the
+          // server reaper deletes the stale agent_sessions row). The SSE
+          // worker can't notice on its own — heartbeat is the canary, so
+          // signal it to abort and reconnect with a fresh session.
+          this.log.warn(
+            { event: "heartbeat_session_invalid", session: this.sessionId, status: result.status },
+            "heartbeat session invalid — signaling worker to reconnect",
+          );
+          this.streamLive = false;
+          this.sessionId = null;
+          this.worker?.postMessage({ type: "reset" });
+        } else {
+          this.log.error(
+            { event: "heartbeat_error", session: this.sessionId, status: result.status, err: result.err },
+            "heartbeat error",
+          );
         }
       }
     }
