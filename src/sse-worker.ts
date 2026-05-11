@@ -111,19 +111,29 @@ async function streamOnce(): Promise<void> {
 
   try {
     while (true) {
-      // Race the read against an interrupt promise. Bun's streaming fetch
-      // does not always honor AbortController.abort() — the reader can hang
-      // indefinitely on a zombie TCP socket even after the controller is
-      // aborted. The interrupt promise gives reset/stop a guaranteed way to
-      // unblock the read.
+      // Race the read against an interrupt promise AND a silence timeout.
+      // - interruptPromise: reset/stop signals from main thread.
+      // - silenceTimeout: ngrok's idle timeout is ~256s; after a server-side
+      //   close, Bun's reader.read() does NOT reliably surface the drop
+      //   (observed: workers stay hung indefinitely with 0 TLS connections,
+      //   0 CPU, no log output). The timeout fires at 300s — long enough
+      //   that any healthy connection will have received SOMETHING (event,
+      //   keepalive, anything) before then, but short enough that the
+      //   silent-disconnect failure mode is caught within ~44s of ngrok
+      //   tearing the connection down.
       const interruptPromise = new Promise<never>((_, reject) => {
         interruptReject = reject;
       });
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => reject(new Error("sse_read_timeout")), 300_000);
+      });
       let chunk: ReadableStreamReadResult<Uint8Array>;
       try {
-        chunk = await Promise.race([reader.read(), interruptPromise]);
+        chunk = await Promise.race([reader.read(), interruptPromise, timeoutPromise]);
       } finally {
         interruptReject = null;
+        if (timeoutHandle) clearTimeout(timeoutHandle);
       }
       const { done, value } = chunk;
       if (done) {
