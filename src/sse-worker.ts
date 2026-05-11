@@ -45,6 +45,8 @@ let signingKey: CryptoKey | null = null;
 let sessionId: string | null = null;
 let lastEventId: string | null = null;
 let abortController: AbortController | null = null;
+let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+let interruptReject: ((err: Error) => void) | null = null;
 let stopped = false;
 let consecutiveAuthFailures = 0;
 const MAX_CONSECUTIVE_AUTH_FAILURES = 10;
@@ -101,6 +103,7 @@ async function streamOnce(): Promise<void> {
   }
 
   const reader = res.body.getReader();
+  activeReader = reader;
   const decoder = new TextDecoder();
   let buf = "";
 
@@ -108,7 +111,21 @@ async function streamOnce(): Promise<void> {
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      // Race the read against an interrupt promise. Bun's streaming fetch
+      // does not always honor AbortController.abort() — the reader can hang
+      // indefinitely on a zombie TCP socket even after the controller is
+      // aborted. The interrupt promise gives reset/stop a guaranteed way to
+      // unblock the read.
+      const interruptPromise = new Promise<never>((_, reject) => {
+        interruptReject = reject;
+      });
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await Promise.race([reader.read(), interruptPromise]);
+      } finally {
+        interruptReject = null;
+      }
+      const { done, value } = chunk;
       if (done) {
         log("warn", { event: "sse_stream_ended", session: sessionId }, "SSE stream reader returned done=true");
         break;
@@ -128,7 +145,9 @@ async function streamOnce(): Promise<void> {
     }
   } finally {
     abortController = null;
-    reader.releaseLock();
+    activeReader = null;
+    interruptReject = null;
+    try { reader.releaseLock(); } catch {}
   }
 }
 
@@ -231,15 +250,27 @@ self.onmessage = (ev) => {
     });
   } else if (data?.type === "reset") {
     // Main thread saw heartbeat fail with 403/404 — our session is stale.
-    // Abort the current SSE read (which is likely hung on a zombie TCP
-    // socket) and clear sessionId so streamLoop's next iteration calls
-    // connect() to create a fresh session.
+    // Abort the current SSE read (which is hung on a zombie TCP socket) and
+    // clear sessionId so streamLoop's next iteration calls connect() for a
+    // fresh session.
+    //
+    // Three mechanisms for unblocking the read, in order of escalation:
+    //   1. abortController.abort()    — signals fetch to abort (Bun: unreliable)
+    //   2. activeReader.cancel()      — releases the lock, signals upstream
+    //   3. interruptReject(...)       — Promise.race rejects in streamOnce
+    //
+    // We do all three because v2.3.2 shipped only (1) and the worker stayed
+    // hung indefinitely — the reader.read() promise never resolved/rejected.
     log("warn", { event: "sse_reset_requested", session: sessionId }, "main signaled session reset");
     sessionId = null;
     lastEventId = null;
     abortController?.abort();
+    activeReader?.cancel().catch(() => {});
+    interruptReject?.(new Error("sse_reset"));
   } else if (data?.type === "stop") {
     stopped = true;
     abortController?.abort();
+    activeReader?.cancel().catch(() => {});
+    interruptReject?.(new Error("sse_stop"));
   }
 };
