@@ -6,19 +6,25 @@
  *
  *   SSE event → channel handler → enrichment pipeline → deliver
  *
- * Architecture (v2.3.1+):
+ * Architecture (v2.3.1+ on Bun, v2.3.5+ adds Node fallback):
  *
- *   [Worker thread]                     [Main thread]
- *   sse-worker.ts                       WireConnection
+ *   [Worker thread or inline]           [Main thread]
+ *   SseRunner                           WireConnection
  *   - register / connect                - heartbeatLoop (timer queue is
  *   - streaming fetch (SSE)               not starved by streaming fetch)
  *   - parseSSE                          - channel handlers
  *   - reconnect / backoff               - enrichment pipelines
  *                                       - send_message / set_plan / ack HTTP
  *
- *   ⇄ postMessage protocol:
- *     main → worker: {type:"boot"|"stop", ...}
- *     worker → main: {type:"stream_live"|"stream_dead"|"event"|"give_up"|"log"}
+ *   ⇄ postMessage protocol (Bun) / direct callback (Node):
+ *     main → driver:  {type:"boot"|"reset"|"stop", ...}
+ *     driver → main:  {type:"stream_live"|"stream_dead"|"event"|"give_up"|"log"}
+ *
+ * Under Bun, the driver is a real Bun Worker (sse-worker.ts) — required to
+ * keep the streaming fetch from starving the main event loop. Under Node,
+ * `Worker` is not a global; we instead run an SseRunner inline (Node's
+ * fetch doesn't have Bun's event-loop-starvation issue, so the worker
+ * isolation isn't needed).
  *
  * Adapter authors use this as their main interface. Channel plugins
  * (IPC, Slack, etc.) register handlers. Enrichment stages are configured
@@ -97,14 +103,20 @@ export type ConnectionOptions = {
   onDisconnect?: () => void;
 };
 
-// --- Worker protocol types ---
+// --- Driver protocol types ---
 
-type WorkerToMainMsg =
+type DriverToMainMsg =
   | { type: "stream_live"; sessionId: string }
   | { type: "stream_dead"; reason?: string }
   | { type: "event"; event: WireEvent }
   | { type: "give_up"; reason: string }
   | { type: "log"; level: "debug" | "info" | "warn" | "error" | "fatal"; fields: Record<string, unknown>; msg: string };
+
+// Minimal shape of either a Bun Worker or an inline-SseRunner adapter.
+interface SseDriver {
+  postMessage(msg: unknown): void;
+  terminate(): void;
+}
 
 export class WireConnection {
   private opts: ConnectionOptions;
@@ -114,7 +126,11 @@ export class WireConnection {
   private stopped = false;
   private log: Logger;
 
-  private worker: Worker | null = null;
+  private driver: SseDriver | null = null;
+  // For the Node inline path: a promise that resolves when the SseRunner
+  // boot loop has fully exited (clean disconnect HTTP sent). stop() awaits
+  // this for symmetry with the Bun worker's 500ms grace.
+  private driverDone: Promise<void> | null = null;
   private bootResolve: ((sessionId: string) => void) | null = null;
   private bootReject: ((err: Error) => void) | null = null;
 
@@ -171,16 +187,20 @@ export class WireConnection {
     this.stopped = false;
     this.signingKey = this.opts.keyPair.privateKey;
 
-    // The streaming fetch lives in a worker so it can't starve our timer
-    // queue (heartbeats, MCP dispatch, etc.). We pass the private key as
-    // PKCS8 base64 since CryptoKey is not structuredClone-able.
+    // The streaming fetch lives in a separate driver (Bun Worker thread on
+    // Bun, inline SseRunner on Node) so it can't starve our timer queue
+    // (heartbeats, MCP dispatch, etc.) on the runtimes where that matters.
+    // We pass the private key as PKCS8 base64 since CryptoKey is not
+    // structuredClone-able through Worker postMessage.
     const privateKeyB64 = await exportPrivateKey(this.signingKey);
 
-    this.worker = new Worker(new URL("./sse-worker.ts", import.meta.url).href);
-    this.worker.onmessage = (ev: MessageEvent<WorkerToMainMsg>) => this.handleWorkerMessage(ev.data);
-    this.worker.onerror = (ev: ErrorEvent) => {
-      this.log.error({ event: "worker_error", message: ev.message, filename: ev.filename, lineno: ev.lineno }, "WORKER_ERROR");
-      this.opts.onError?.(new Error(`SSE worker error: ${ev.message}`));
+    const bootMsg = {
+      type: "boot" as const,
+      url: this.opts.url,
+      agentId: this.opts.agentId,
+      agentName: this.opts.agentName,
+      ccSessionId: this.opts.ccSessionId,
+      privateKeyB64,
     };
 
     // Boot promise: resolves on first stream_live, rejects on give_up.
@@ -189,14 +209,40 @@ export class WireConnection {
       this.bootReject = reject;
     });
 
-    this.worker.postMessage({
-      type: "boot",
-      url: this.opts.url,
-      agentId: this.opts.agentId,
-      agentName: this.opts.agentName,
-      ccSessionId: this.opts.ccSessionId,
-      privateKeyB64,
-    });
+    if (typeof Worker !== "undefined") {
+      // Bun (or any runtime with the Web Worker API) — isolate the streaming
+      // fetch in a Worker thread. The 2026-05-07 bug was Bun-specific event-
+      // loop starvation; this is the durable fix for that case.
+      const w = new Worker(new URL("./sse-worker.ts", import.meta.url).href);
+      w.onmessage = (ev: MessageEvent<DriverToMainMsg>) => this.handleWorkerMessage(ev.data);
+      w.onerror = (ev: ErrorEvent) => {
+        this.log.error({ event: "worker_error", message: ev.message, filename: ev.filename, lineno: ev.lineno }, "WORKER_ERROR");
+        this.opts.onError?.(new Error(`SSE worker error: ${ev.message}`));
+      };
+      w.postMessage(bootMsg);
+      this.driver = w as unknown as SseDriver;
+    } else {
+      // Node / tsx — no global Worker. Run the SseRunner inline on the main
+      // thread. Node's fetch doesn't block the event loop the way Bun's does
+      // (undici reads from the socket via libuv I/O threads), so the worker
+      // isolation isn't required here. Without this branch, `new Worker(...)`
+      // throws `ReferenceError: Worker is not defined` and the wire MCP
+      // child crashes 2s after MCP handshake (wire-codex on codex 0.125,
+      // observed 2026-05-11 — agents appeared grey on the dashboard because
+      // the MCP died before heartbeat could fire).
+      const { SseRunner } = await import("./sse-runner.js");
+      const runner = new SseRunner((msg) => this.handleWorkerMessage(msg as DriverToMainMsg));
+      this.driverDone = runner.boot(bootMsg);
+      this.driver = {
+        postMessage: (msg: unknown) => {
+          const m = msg as { type?: string };
+          if (m?.type === "reset") runner.reset();
+          else if (m?.type === "stop") runner.stop();
+          // type==="boot" is already initiated above; ignore re-send.
+        },
+        terminate: () => runner.stop(),
+      };
+    }
 
     await bootDone;
 
@@ -208,20 +254,30 @@ export class WireConnection {
 
   async stop(): Promise<void> {
     this.stopped = true;
-    if (this.worker) {
-      this.worker.postMessage({ type: "stop" });
-      // Give worker a moment to send disconnect HTTP and exit cleanly.
-      await new Promise((r) => setTimeout(r, 500));
-      this.worker.terminate();
-      this.worker = null;
+    if (this.driver) {
+      this.driver.postMessage({ type: "stop" });
+      if (this.driverDone) {
+        // Inline path — await the runner's clean exit (disconnect HTTP sent
+        // inside boot()). Cap the wait so we don't block shutdown forever.
+        await Promise.race([
+          this.driverDone,
+          new Promise((r) => setTimeout(r, 1500)),
+        ]);
+      } else {
+        // Worker path — give it the same 500ms grace as v2.3.x.
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      this.driver.terminate();
+      this.driver = null;
+      this.driverDone = null;
     }
     this.streamLive = false;
     this.sessionId = null;
   }
 
-  // --- Worker message dispatch ---
+  // --- Driver message dispatch (Bun worker or inline SseRunner) ---
 
-  private handleWorkerMessage(msg: WorkerToMainMsg): void {
+  private handleWorkerMessage(msg: DriverToMainMsg): void {
     switch (msg.type) {
       case "stream_live": {
         const wasFirstConnect = this.bootResolve != null;
@@ -426,7 +482,7 @@ export class WireConnection {
           );
           this.streamLive = false;
           this.sessionId = null;
-          this.worker?.postMessage({ type: "reset" });
+          this.driver?.postMessage({ type: "reset" });
         } else {
           this.log.error(
             { event: "heartbeat_error", session: this.sessionId, status: result.status, err: result.err },
