@@ -20,7 +20,7 @@ export { createLogger, type Logger } from "./logger.js";
 
 // Low-level tools (for custom adapters or channel plugins)
 export { generateKeyPair, exportPrivateKey, importPrivateKey, importKeyPair, signBody, derivePublicKeyB64, createAuthJwt, hashBody, type KeyPair } from "./crypto.js";
-export { register, connect, disconnect, ack, heartbeat, setPlan, sendSignedMessage } from "./http.js";
+export { register, registerOrRefresh, connect, disconnect, ack, heartbeat, setPlan, sendSignedMessage, type RegisterMode, type RegisterOrRefreshResult } from "./http.js";
 export { parseSSEChunk } from "./sse.js";
 export { retryWithBackoff } from "./reconnect.js";
 

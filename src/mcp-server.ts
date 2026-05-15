@@ -28,9 +28,14 @@ import {
   createLogger,
   importKeyPair,
   setPlan,
+  registerOrRefresh,
   type DeliveryPayload,
   type KeyPair,
 } from "./index.js";
+
+function titleCase(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
 
 const log = createLogger("wire-cc", 2); // stderr — stdout is MCP transport
 
@@ -168,6 +173,64 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "register_agent",
+      description:
+        "Sponsor-register a Wire agent. Three modes (the tool picks based on args):\n\n" +
+        "  (1) fresh — no pubkey supplied and id is unknown to Wire. Generates a " +
+        "fresh Ed25519 keypair, registers it as `id`, and returns " +
+        "`private_key_b64` for the caller to pass to crew `agent_launch` as " +
+        "`env.AGENT_PRIVATE_KEY`.\n\n" +
+        "  (2) refresh-existing — no pubkey supplied but Wire already has a row " +
+        "at this id. Reuses the existing pubkey so the live agent process " +
+        "(which still holds the matching private key) keeps working. Wire's " +
+        "reaped-readmission path un-greys the row. NO private_key_b64 is " +
+        "returned in this mode.\n\n" +
+        "  (3) byo — caller supplies `pubkey` (base64 raw Ed25519, 32 bytes). " +
+        "Skips keypair generation, registers the supplied pubkey. NO " +
+        "private_key_b64 is returned — the caller already has it. Useful when " +
+        "the keypair is managed client-side or stashed externally.\n\n" +
+        "Typical fresh flow:\n" +
+        "  const { agent_id, display_name, private_key_b64 } = await register_agent({ id: 'danish' });\n" +
+        "  await agent_launch({ env: { AGENT_ID: agent_id, AGENT_PRIVATE_KEY: private_key_b64, ... } });\n\n" +
+        "Typical refresh-existing flow (un-grey a reaped ephemeral whose process " +
+        "is still alive):\n" +
+        "  const { mode } = await register_agent({ id: 'eclair2' });\n" +
+        "  // mode === 'refresh-existing'; eclair2's row is un-greyed.\n\n" +
+        "Keys never touch disk inside this tool — they flow through the response " +
+        "and the caller's env. The sponsor's AGENT_PRIVATE_KEY signs the " +
+        "registration request; Wire trusts the sponsor's JWT and accepts the " +
+        "(new or re-registered) agent's public key.\n\n" +
+        "If an agent with this id already exists with a DIFFERENT pubkey AND " +
+        "you supplied a mismatching `pubkey` (or `force_rotate: false`), the " +
+        "call fails with HTTP 409 `agent_exists_pubkey_mismatch` to prevent " +
+        "silently rotating the keypair out from under any process still " +
+        "holding the previous key. Pass `force_rotate: true` to override — " +
+        "but only when you've confirmed no live process holds the old key.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          id: {
+            type: "string",
+            description: "New agent's ID (the name it will register under and use as `env.AGENT_ID`).",
+          },
+          display_name: {
+            type: "string",
+            description: "Optional display name. Defaults to TitleCase(id).",
+          },
+          pubkey: {
+            type: "string",
+            description: "Optional. Base64 raw Ed25519 public key (32 bytes). When supplied, the tool skips keypair generation and registers this pubkey on Wire as `id`. Returns no private_key_b64.",
+          },
+          force_rotate: {
+            type: "boolean",
+            description: "Default false. When true, mints a fresh keypair regardless of any existing row — permanently locking out any process still holding the previous private key. Use only when you've confirmed no live process holds the old key.",
+          },
+        },
+        required: ["id"],
+        additionalProperties: false,
+      },
+    },
   ],
 }));
 
@@ -236,6 +299,75 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     } catch (e: any) {
       return {
         content: [{ type: "text" as const, text: `heartbeat_delete failed: ${e.message}` }],
+        isError: true,
+      };
+    }
+  }
+
+  if (req.params.name === "register_agent") {
+    const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+    const id = args.id;
+    const displayName = args.display_name;
+    const forceRotate = args.force_rotate;
+    const providedPubkey = args.pubkey;
+
+    if (typeof id !== "string" || id.length === 0) {
+      return {
+        content: [{ type: "text" as const, text: `register_agent: 'id' is required (string). Got: ${JSON.stringify(id)}.` }],
+        isError: true,
+      };
+    }
+    if (displayName !== undefined && typeof displayName !== "string") {
+      return {
+        content: [{ type: "text" as const, text: `register_agent: 'display_name' must be a string if provided. Got: ${JSON.stringify(displayName)}.` }],
+        isError: true,
+      };
+    }
+    if (forceRotate !== undefined && typeof forceRotate !== "boolean") {
+      return {
+        content: [{ type: "text" as const, text: `register_agent: 'force_rotate' must be a boolean if provided. Got: ${JSON.stringify(forceRotate)}.` }],
+        isError: true,
+      };
+    }
+    if (providedPubkey !== undefined && typeof providedPubkey !== "string") {
+      return {
+        content: [{ type: "text" as const, text: `register_agent: 'pubkey' must be a base64 string if provided. Got: ${JSON.stringify(providedPubkey)}.` }],
+        isError: true,
+      };
+    }
+    if (!keyPair) {
+      return {
+        content: [{ type: "text" as const, text: `register_agent: sponsor not initialized. Set AGENT_PRIVATE_KEY in the caller's env.` }],
+        isError: true,
+      };
+    }
+
+    try {
+      const resolvedName = (displayName as string | undefined) ?? titleCase(id);
+      const result = await registerOrRefresh(
+        WIRE_URL,
+        AGENT_ID,
+        keyPair.privateKey,
+        id,
+        resolvedName,
+        {
+          pubkey: providedPubkey as string | undefined,
+          force_rotate: forceRotate as boolean | undefined,
+        },
+      );
+      const response: Record<string, string> = {
+        agent_id: result.agentId,
+        display_name: result.displayName,
+        pubkey: result.pubkey,
+        mode: result.mode,
+      };
+      if (result.privateKey) response.private_key_b64 = result.privateKey;
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(response) }],
+      };
+    } catch (e: any) {
+      return {
+        content: [{ type: "text" as const, text: `register_agent failed: ${e.message}` }],
         isError: true,
       };
     }

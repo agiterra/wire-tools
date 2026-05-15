@@ -8,7 +8,7 @@
  */
 
 import { join } from "path";
-import { createAuthJwt } from "./crypto.js";
+import { createAuthJwt, generateKeyPair, exportPrivateKey, derivePublicKeyB64 } from "./crypto.js";
 import { createLogger } from "./logger.js";
 
 const WIRE_LOG = join(process.env.HOME ?? "/tmp", ".wire", "wire-connection.jsonl");
@@ -58,6 +58,92 @@ export async function register(
   if (!res.ok) {
     throw new Error(`Wire register failed (${res.status}): ${await res.text()}`);
   }
+}
+
+export type RegisterMode = "fresh" | "byo" | "refresh-existing";
+
+export type RegisterOrRefreshResult = {
+  agentId: string;
+  displayName: string;
+  pubkey: string;
+  privateKey?: string; // base64 PKCS8, only present in `fresh` mode
+  mode: RegisterMode;
+};
+
+/**
+ * Higher-level registration that handles three sponsor flows in one call:
+ *
+ *   - `byo`              — caller supplied a pubkey, just register it.
+ *   - `refresh-existing` — no pubkey supplied, but Wire already has a row
+ *                          at this id. Reuse the existing pubkey so the
+ *                          live agent process (which still holds the
+ *                          matching private key) keeps working.
+ *   - `fresh`            — no pubkey supplied and id is unknown. Mint a
+ *                          fresh keypair and return the private key so the
+ *                          caller can hand it to the spawn flow.
+ *
+ * `force_rotate: true` skips the existing-row probe and always mints a
+ * fresh keypair, permanently locking out any process still holding the
+ * old key. Use only when you've confirmed no live process holds it.
+ *
+ * The smart-refresh path was added 2026-05-15 (Tim): "If the Wire has the
+ * pub key in hand, then brioche should just be able to re-register
+ * eclair2 without sending the pub key, and The Wire should just mark her
+ * as active."
+ */
+export async function registerOrRefresh(
+  url: string,
+  callerAgentId: string,
+  callerSigningKey: CryptoKey,
+  newAgentId: string,
+  displayName: string,
+  options?: { pubkey?: string; force_rotate?: boolean },
+): Promise<RegisterOrRefreshResult> {
+  const providedPubkey = options?.pubkey;
+  const forceRotate = options?.force_rotate === true;
+
+  let pubkey: string | undefined = providedPubkey;
+  let privateKey: string | undefined;
+  let mode: RegisterMode;
+
+  if (providedPubkey) {
+    mode = "byo";
+  } else if (!forceRotate) {
+    // Probe for existing row; if found, reuse its pubkey.
+    try {
+      const res = await fetch(`${url}/agents?kind=all`);
+      if (res.ok) {
+        const all = (await res.json()) as Array<{ id: string; pubkey: string }>;
+        const existing = all.find((a) => a.id === newAgentId);
+        if (existing) {
+          pubkey = existing.pubkey;
+          mode = "refresh-existing";
+        }
+      }
+    } catch {
+      // Network blip — fall through to keypair generation. Worst case is a
+      // pubkey-mismatch error from /agents/register, which surfaces clearly.
+    }
+  }
+
+  if (!pubkey) {
+    const kp = await generateKeyPair();
+    privateKey = await exportPrivateKey(kp.privateKey);
+    pubkey = await derivePublicKeyB64(kp.privateKey);
+    mode = "fresh";
+  }
+
+  await register(
+    url,
+    callerAgentId,
+    newAgentId,
+    displayName,
+    pubkey,
+    callerSigningKey,
+    forceRotate ? { force_rotate: true } : undefined,
+  );
+
+  return { agentId: newAgentId, displayName, pubkey, privateKey, mode: mode! };
 }
 
 export async function connect(
