@@ -17,7 +17,12 @@ export function detectCmux(): TerminalTransport | null {
     name: "cmux",
     async send(prompt: string): Promise<boolean> {
       return new Promise((resolve) => {
-        const child = spawn("cmux", ["send", "--surface", surface, prompt], {
+        // Terminate with LF+CR (0x0A 0x0D). See screen.ts for the
+        // empirical rationale — codex v0.130's TUI submits on this
+        // specific sequence, not on `\r`, `\n`, or `\r\n` alone.
+        const body = prompt.replace(/[\r\n]+$/, "");
+        const text = body + "\n\r";
+        const child = spawn("cmux", ["send", "--surface", surface, text], {
           stdio: ["ignore", "pipe", "pipe"],
         });
         child.on("error", () => resolve(false));

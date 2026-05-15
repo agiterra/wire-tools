@@ -108,7 +108,32 @@ function formatPushPrompt(source: string, topic: string, content: string, seq: n
   // Concise framing so the agent recognizes this as an inbound Wire message
   // rather than free-form operator input. Stays within a few lines so it
   // doesn't dominate the next turn.
-  return `[Wire ${topic} from ${source} (seq ${seq})]\n${content}`;
+  //
+  // `content` for webhook-wrapped messages is the FULL envelope JSON
+  // (including headers with auth tokens) — way too much, and a security
+  // hazard if it lands in a user-facing screen. Extract just the
+  // user-visible text from the envelope's payload, falling back to the
+  // raw content for non-webhook channels.
+  let userText = content;
+  try {
+    const parsed = JSON.parse(content);
+    if (parsed && typeof parsed === "object") {
+      // Strip auth-bearing headers if present, regardless of which
+      // shape we end up rendering.
+      const payload = parsed.payload ?? parsed;
+      if (typeof payload === "string") {
+        userText = payload;
+      } else if (payload && typeof payload === "object") {
+        userText = (payload.text as string)
+          ?? (payload.body as string)
+          ?? (payload.message as string)
+          ?? JSON.stringify(payload);
+      }
+    }
+  } catch {
+    // Not JSON — use as-is.
+  }
+  return `[Wire ${topic} from ${source} (seq ${seq})]\n${userText}`;
 }
 
 // --- Connection state notifications ---
