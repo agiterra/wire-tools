@@ -98,6 +98,88 @@ type BufferedMessage = {
 const messageBuffer: BufferedMessage[] = [];
 const BUFFER_LIMIT = 200;
 
+// --- Connection state notifications ---
+//
+// The MCP process knows whether its SSE/heartbeat to Wire is healthy. When
+// that flips, inject a Channel notification so the agent learns about it in
+// real time — without waiting on the next inbound message to surface the
+// fact that, e.g., the Wire is unreachable.
+//
+// State machine:
+//   unknown      → boot state. No notification on first connect (the agent
+//                  already knows it just started).
+//   connected    → SSE is live, register/connect succeeded.
+//   disconnected → SSE dropped / heartbeat failed / reconnect in flight.
+//
+// Only TRANSITIONS between known states (connected ↔ disconnected) emit a
+// notification. unknown → connected is silent (initial boot).
+type WireConnState = "unknown" | "connected" | "disconnected";
+let connState: WireConnState = "unknown";
+
+let connStateSeq = 0;
+function injectConnectionStateNotification(
+  newState: "connected" | "disconnected",
+  detail?: string,
+): void {
+  const ts = new Date().toISOString();
+  connStateSeq += 1;
+  const content =
+    newState === "connected"
+      ? `Wire connection RESTORED${detail ? ` (${detail})` : ""}`
+      : `Wire connection LOST${detail ? ` (${detail})` : ""} — reconnect attempts in background`;
+
+  if (isPollMode()) {
+    if (messageBuffer.length >= BUFFER_LIMIT) {
+      const dropped = messageBuffer.shift();
+      log.warn({ event: "buffer_overflow", droppedSeq: dropped?.seq, limit: BUFFER_LIMIT }, "buffer full — dropped oldest");
+    }
+    messageBuffer.push({
+      seq: -connStateSeq, // negative seq distinguishes system events from Wire-delivered messages
+      source: "wire-system",
+      topic: "wire.connection_state",
+      content,
+      ts,
+      metadata: { state: newState, detail: detail ?? null },
+    });
+    log.info({ event: "conn_state_buffered", state: newState, detail }, "connection state change buffered for poll");
+    return;
+  }
+
+  void mcp.notification({
+    method: "notifications/claude/channel" as const,
+    params: {
+      content,
+      meta: {
+        chat_id: "wire:system",
+        message_id: `wire-conn-${connStateSeq}`,
+        user: "wire-system",
+        ts,
+        seq: String(-connStateSeq),
+        source: "wire-system",
+        topic: "wire.connection_state",
+        created_at: String(Date.now()),
+        state: newState,
+        detail: detail ?? "",
+      },
+    },
+  }).catch((e) =>
+    log.error({ event: "conn_state_notify_failed", err: e }, "failed to inject connection state notification"),
+  );
+  log.info({ event: "conn_state_pushed", state: newState, detail }, "connection state change pushed");
+}
+
+function setConnState(newState: "connected" | "disconnected", detail?: string): void {
+  if (connState === newState) return;
+  const prev = connState;
+  connState = newState;
+  // Silent on initial transition from unknown → connected (boot is not news).
+  if (prev === "unknown" && newState === "connected") {
+    log.info({ event: "conn_state_initial", state: newState }, "initial Wire connection");
+    return;
+  }
+  injectConnectionStateNotification(newState, detail);
+}
+
 // --- Tools ---
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -485,6 +567,7 @@ export async function startServer(): Promise<void> {
     deliver,
     onConnect: (sessionId) => {
       log.info({ event: "connected", sseSession: sessionId, ccSession: CC_SESSION_ID }, "connected");
+      setConnState("connected", `session ${sessionId.slice(0, 8)}`);
       try {
         writeFileSync(sessionFile, JSON.stringify({
           agentId: AGENT_ID,
@@ -498,7 +581,10 @@ export async function startServer(): Promise<void> {
         log.error({ event: "session_file_write_failed", path: sessionFile, err: e }, "failed to write session file");
       }
     },
-    onDisconnect: () => log.warn({ event: "disconnected" }, "disconnected, reconnecting..."),
+    onDisconnect: () => {
+      log.warn({ event: "disconnected" }, "disconnected, reconnecting...");
+      setConnState("disconnected");
+    },
     onError: (e) => log.error({ event: "error", err: e }, "wire error"),
   });
 
