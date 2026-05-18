@@ -29,6 +29,7 @@ import {
   importKeyPair,
   setPlan,
   registerOrRefresh,
+  createAuthJwt,
   type DeliveryPayload,
   type KeyPair,
 } from "./index.js";
@@ -385,15 +386,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const args = req.params.arguments as { agent_id?: string; cron: string; prompt: string };
     const agentId = args.agent_id ?? AGENT_ID;
     try {
+      if (!keyPair) throw new Error("not initialized");
+      const body = JSON.stringify({
+        agent_id: agentId,
+        cron: args.cron,
+        prompt: args.prompt,
+        created_by: AGENT_ID,
+      });
+      const token = await createAuthJwt(keyPair.privateKey, AGENT_ID, body);
       const res = await fetch(`${WIRE_URL}/heartbeats`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          agent_id: agentId,
-          cron: args.cron,
-          prompt: args.prompt,
-          created_by: AGENT_ID,
-        }),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body,
       });
       if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
       const hb = await res.json();
@@ -411,7 +415,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (req.params.name === "heartbeat_delete") {
     const { id } = req.params.arguments as { id: string };
     try {
-      const res = await fetch(`${WIRE_URL}/heartbeats/${id}`, { method: "DELETE" });
+      if (!keyPair) throw new Error("not initialized");
+      const token = await createAuthJwt(keyPair.privateKey, AGENT_ID, "");
+      const res = await fetch(`${WIRE_URL}/heartbeats/${id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
       if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
       return {
         content: [{ type: "text" as const, text: `heartbeat deleted: ${id}` }],
@@ -496,10 +505,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (req.params.name === "heartbeat_list") {
     const args = req.params.arguments as { agent_id?: string } | undefined;
     try {
+      if (!keyPair) throw new Error("not initialized");
       const url = args?.agent_id
         ? `${WIRE_URL}/heartbeats?agent_id=${args.agent_id}`
         : `${WIRE_URL}/heartbeats`;
-      const res = await fetch(url);
+      const token = await createAuthJwt(keyPair.privateKey, AGENT_ID, "");
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
       if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
       const list = await res.json();
       return {
