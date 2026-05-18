@@ -541,6 +541,16 @@ async function deliver(payload: DeliveryPayload): Promise<void> {
   const topic = canonicalTopic(raw.topic);
   const ts = new Date(raw.created_at).toISOString();
 
+  // wire.keepalive is a server-emitted SSE ping (see wire/src/server.ts
+  // keepalive setInterval). Its purpose is to keep the SSE byte stream
+  // alive across ngrok's ~256s idle close and our own 300s silence-
+  // timeout. The event must reach our SSE parser (so reading those bytes
+  // resets the silence-timeout), but we should NOT dispatch it to the
+  // agent's channel — it carries no information for the agent.
+  if (topic === "wire.keepalive") {
+    return;
+  }
+
   if (isPollMode()) {
     // Buffer first — always — so get_pending_messages stays useful as a
     // catch-up tool whether or not push delivery worked. Buffer is bounded;
