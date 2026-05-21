@@ -34,8 +34,6 @@ import { retryWithBackoff } from "./reconnect.js";
 
 const WIRE_LOG = join(process.env.HOME ?? "/tmp", ".wire", "wire-connection.jsonl");
 
-const MAX_CONSECUTIVE_AUTH_FAILURES = 10;
-
 export type SseRunnerBootMsg = {
   url: string;
   agentId: string;
@@ -71,7 +69,6 @@ export class SseRunner {
   private activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private interruptReject: ((err: Error) => void) | null = null;
   private stopped = false;
-  private consecutiveAuthFailures = 0;
 
   private bootPromise: Promise<void> | null = null;
 
@@ -85,21 +82,6 @@ export class SseRunner {
 
   private log(level: "debug" | "info" | "warn" | "error" | "fatal", fields: Record<string, unknown>, msg: string): void {
     this.post({ type: "log", level, fields: { ...fields, agent: this.agentId, log: WIRE_LOG }, msg });
-  }
-
-  private maybeGiveUp(err: unknown): void {
-    const msg = stringifyErr(err);
-    const isAuthFailure = /\((401|403)\)/.test(msg);
-    if (!isAuthFailure) {
-      this.consecutiveAuthFailures = 0;
-      return;
-    }
-    this.consecutiveAuthFailures += 1;
-    if (this.consecutiveAuthFailures >= MAX_CONSECUTIVE_AUTH_FAILURES) {
-      this.log("fatal", { event: "auth_give_up", consecutive: this.consecutiveAuthFailures, lastErr: msg }, "Wire rejected register/connect with 401/403 too many times");
-      this.post({ type: "give_up", reason: msg });
-      this.stopped = true;
-    }
   }
 
   private async streamOnce(): Promise<void> {
@@ -187,19 +169,13 @@ export class SseRunner {
       async () => {
         if (!this.signingKey) throw new Error("no signing key");
         const pubB64 = await derivePublicKeyB64(this.signingKey);
-        await register(this.url, this.agentId, this.agentId, this.agentName, pubB64, this.signingKey).then(
-          () => { this.consecutiveAuthFailures = 0; },
-          (e) => {
-            this.log("error", { event: "register_retry_failed", err: stringifyErr(e) }, "REGISTER_RETRY_FAILED");
-            this.maybeGiveUp(e);
-            throw e;
-          },
-        );
+        await register(this.url, this.agentId, this.agentId, this.agentName, pubB64, this.signingKey);
         if (!this.sessionId) {
           this.sessionId = await connect(this.url, this.agentId, this.signingKey, this.ccSessionId);
         }
       },
       {
+        maxBackoff: 60_000,
         shouldStop: () => this.stopped,
         onError: (e, ms) => this.log("error", { event: "reconnect_retry", err: stringifyErr(e), backoffMs: ms }, `Wire reconnect failed: ${e}; retrying in ${ms}ms`),
       },
@@ -223,7 +199,7 @@ export class SseRunner {
 
       this.post({ type: "stream_dead" });
       await new Promise((r) => setTimeout(r, backoff));
-      backoff = Math.min(backoff * 2, 30000);
+      backoff = Math.min(backoff * 2, 60_000);
       if (this.stopped) return;
 
       await this.reregisterAndReconnect();
@@ -232,7 +208,10 @@ export class SseRunner {
 
   /**
    * Run the full register → connect → streamLoop lifecycle.
-   * Returns when stopped (clean exit) or when the give-up gate fires.
+   * Returns when stopped (clean exit). Wire clients retry forever — auth
+   * failures, server outages, and dropped connections all stay in the
+   * retry loop until stop() is called. give_up is reserved for truly
+   * unrecoverable boot crashes (e.g. invalid private key).
    */
   boot(msg: SseRunnerBootMsg): Promise<void> {
     if (this.bootPromise) return this.bootPromise;
@@ -254,17 +233,11 @@ export class SseRunner {
       async () => {
         if (!this.signingKey) throw new Error("no signing key");
         const pubB64 = await derivePublicKeyB64(this.signingKey);
-        await register(this.url, this.agentId, this.agentId, this.agentName, pubB64, this.signingKey).then(
-          () => { this.consecutiveAuthFailures = 0; },
-          (e) => {
-            this.log("error", { event: "register_retry_failed", err: stringifyErr(e) }, "REGISTER_RETRY_FAILED");
-            this.maybeGiveUp(e);
-            throw e;
-          },
-        );
+        await register(this.url, this.agentId, this.agentId, this.agentName, pubB64, this.signingKey);
         this.sessionId = await connect(this.url, this.agentId, this.signingKey, this.ccSessionId);
       },
       {
+        maxBackoff: 60_000,
         shouldStop: () => this.stopped,
         onError: (e, ms) => this.log("error", { event: "startup_retry", err: stringifyErr(e), backoffMs: ms }, `Wire startup failed: ${e}; retrying in ${ms}ms`),
       },
