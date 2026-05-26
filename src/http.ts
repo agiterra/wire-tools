@@ -273,12 +273,21 @@ export async function sendSignedMessage(
   dest?: string,
 ): Promise<{ seq: number }> {
   const body = JSON.stringify(payload);
+  const isBroadcast = !dest;
   const endpoint = dest
     ? `${url}/webhooks/${dest}/${topic}`
     : `${url}/broadcast/${topic}`;
+  const baseHeaders = await jwtHeaders(agentId, body, signingKey);
+  // Wire server (v1.9.0+) requires explicit broadcast-intent header on
+  // /broadcast/:topic. The SDK adds it transparently when no dest is
+  // supplied so the omission-equals-broadcast semantics still work for
+  // existing callers, while direct HTTP clients now have to declare intent.
+  const headers = isBroadcast
+    ? { ...baseHeaders, "x-wire-broadcast": "1" }
+    : baseHeaders;
   const res = await fetch(endpoint, {
     method: "POST",
-    headers: await jwtHeaders(agentId, body, signingKey),
+    headers,
     body,
   });
   if (!res.ok) {
