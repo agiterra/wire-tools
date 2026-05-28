@@ -155,6 +155,21 @@ function formatPushPrompt(source: string, topic: string, content: string, seq: n
 type WireConnState = "unknown" | "connected" | "disconnected";
 let connState: WireConnState = "unknown";
 
+// Sleep-vs-real-outage distinguisher. A self-ticker records Date.now()
+// every TICK_INTERVAL_MS. When our process is suspended (macOS sleep,
+// SIGSTOP, etc.), this ticker stops firing. When the process resumes,
+// the gap between lastSelfTick and Date.now() will be much larger than
+// TICK_INTERVAL_MS. A real SSE outage leaves the process running, so
+// the ticker keeps up and the gap stays small.
+const SELF_TICK_INTERVAL_MS = 5_000;
+const SELF_TICK_SUSPEND_THRESHOLD_MS = 15_000; // 3x interval — clearly missed ticks
+let lastSelfTick = Date.now();
+setInterval(() => { lastSelfTick = Date.now(); }, SELF_TICK_INTERVAL_MS).unref?.();
+
+function processWasSuspended(): boolean {
+  return Date.now() - lastSelfTick > SELF_TICK_SUSPEND_THRESHOLD_MS;
+}
+
 let connStateSeq = 0;
 function injectConnectionStateNotification(
   newState: "connected" | "disconnected",
@@ -166,16 +181,56 @@ function injectConnectionStateNotification(
       ? `Wire connection RESTORED${detail ? ` (${detail})` : ""}`
       : `Wire connection LOST${detail ? ` (${detail})` : ""} — reconnect attempts in background`;
 
-  // v2.9.0: stop pushing connection-state changes into the agent's CC
-  // channel. macOS sleep/wake produces the same disconnect→reconnect
-  // signature as a real wire outage from the agent's POV (clock gap is
-  // invisible at the channel layer), so every sleep cycle was injecting
-  // a noisy LOST/RESTORED pair into the conversation. We still log
-  // server-side so wire-connection.jsonl preserves the timeline for
-  // debugging; the agent's context stays clean. A future v2.10 may
-  // gate channel injection on intra-process clock-gap detection so
-  // real outages can be re-surfaced.
-  log.info({ event: "conn_state_suppressed", state: newState, detail, mode: isPollMode() ? "poll" : "push", content }, "connection state change (channel injection suppressed)");
+  // v2.10.0: suppress channel injection when the process was just
+  // suspended (macOS sleep/wake). A real outage leaves the process
+  // running, so the self-tick stays fresh and we inject as usual.
+  // A suspend leaves the self-tick stale; the resulting disconnect→
+  // reconnect is noise from the agent's POV (it wasn't running either).
+  const suspended = processWasSuspended();
+  if (suspended) {
+    log.info({ event: "conn_state_suspended_skip", state: newState, detail, content, lastTickAgeMs: Date.now() - lastSelfTick }, "channel injection skipped — process was suspended");
+    return;
+  }
+
+  if (isPollMode()) {
+    if (messageBuffer.length >= BUFFER_LIMIT) {
+      const dropped = messageBuffer.shift();
+      log.warn({ event: "buffer_overflow", droppedSeq: dropped?.seq, limit: BUFFER_LIMIT }, "buffer full — dropped oldest");
+    }
+    const ts = new Date().toISOString();
+    messageBuffer.push({
+      seq: -connStateSeq,
+      source: "wire-system",
+      topic: "wire.connection_state",
+      content,
+      ts,
+      metadata: { state: newState, detail: detail ?? null },
+    });
+    log.info({ event: "conn_state_buffered", state: newState, detail }, "connection state change buffered for poll");
+    return;
+  }
+
+  void mcp.notification({
+    method: "notifications/claude/channel" as const,
+    params: {
+      content,
+      meta: {
+        chat_id: "wire:system",
+        message_id: `wire-conn-${connStateSeq}`,
+        user: "wire-system",
+        ts: new Date().toISOString(),
+        seq: String(-connStateSeq),
+        source: "wire-system",
+        topic: "wire.connection_state",
+        created_at: String(Date.now()),
+        state: newState,
+        detail: detail ?? "",
+      },
+    },
+  }).catch((e) =>
+    log.error({ event: "conn_state_notify_failed", err: e }, "failed to inject connection state notification"),
+  );
+  log.info({ event: "conn_state_pushed", state: newState, detail }, "connection state change pushed");
 }
 
 function setConnState(newState: "connected" | "disconnected", detail?: string): void {
