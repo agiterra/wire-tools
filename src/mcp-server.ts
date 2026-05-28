@@ -160,51 +160,22 @@ function injectConnectionStateNotification(
   newState: "connected" | "disconnected",
   detail?: string,
 ): void {
-  const ts = new Date().toISOString();
   connStateSeq += 1;
   const content =
     newState === "connected"
       ? `Wire connection RESTORED${detail ? ` (${detail})` : ""}`
       : `Wire connection LOST${detail ? ` (${detail})` : ""} — reconnect attempts in background`;
 
-  if (isPollMode()) {
-    if (messageBuffer.length >= BUFFER_LIMIT) {
-      const dropped = messageBuffer.shift();
-      log.warn({ event: "buffer_overflow", droppedSeq: dropped?.seq, limit: BUFFER_LIMIT }, "buffer full — dropped oldest");
-    }
-    messageBuffer.push({
-      seq: -connStateSeq, // negative seq distinguishes system events from Wire-delivered messages
-      source: "wire-system",
-      topic: "wire.connection_state",
-      content,
-      ts,
-      metadata: { state: newState, detail: detail ?? null },
-    });
-    log.info({ event: "conn_state_buffered", state: newState, detail }, "connection state change buffered for poll");
-    return;
-  }
-
-  void mcp.notification({
-    method: "notifications/claude/channel" as const,
-    params: {
-      content,
-      meta: {
-        chat_id: "wire:system",
-        message_id: `wire-conn-${connStateSeq}`,
-        user: "wire-system",
-        ts,
-        seq: String(-connStateSeq),
-        source: "wire-system",
-        topic: "wire.connection_state",
-        created_at: String(Date.now()),
-        state: newState,
-        detail: detail ?? "",
-      },
-    },
-  }).catch((e) =>
-    log.error({ event: "conn_state_notify_failed", err: e }, "failed to inject connection state notification"),
-  );
-  log.info({ event: "conn_state_pushed", state: newState, detail }, "connection state change pushed");
+  // v2.9.0: stop pushing connection-state changes into the agent's CC
+  // channel. macOS sleep/wake produces the same disconnect→reconnect
+  // signature as a real wire outage from the agent's POV (clock gap is
+  // invisible at the channel layer), so every sleep cycle was injecting
+  // a noisy LOST/RESTORED pair into the conversation. We still log
+  // server-side so wire-connection.jsonl preserves the timeline for
+  // debugging; the agent's context stays clean. A future v2.10 may
+  // gate channel injection on intra-process clock-gap detection so
+  // real outages can be re-surfaced.
+  log.info({ event: "conn_state_suppressed", state: newState, detail, mode: isPollMode() ? "poll" : "push", content }, "connection state change (channel injection suppressed)");
 }
 
 function setConnState(newState: "connected" | "disconnected", detail?: string): void {
