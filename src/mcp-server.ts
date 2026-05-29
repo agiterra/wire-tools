@@ -176,61 +176,23 @@ function injectConnectionStateNotification(
   detail?: string,
 ): void {
   connStateSeq += 1;
-  const content =
-    newState === "connected"
-      ? `Wire connection RESTORED${detail ? ` (${detail})` : ""}`
-      : `Wire connection LOST${detail ? ` (${detail})` : ""} — reconnect attempts in background`;
 
-  // v2.10.0: suppress channel injection when the process was just
-  // suspended (macOS sleep/wake). A real outage leaves the process
-  // running, so the self-tick stays fresh and we inject as usual.
-  // A suspend leaves the self-tick stale; the resulting disconnect→
-  // reconnect is noise from the agent's POV (it wasn't running either).
-  const suspended = processWasSuspended();
-  if (suspended) {
-    log.info({ event: "conn_state_suspended_skip", state: newState, detail, content, lastTickAgeMs: Date.now() - lastSelfTick }, "channel injection skipped — process was suspended");
-    return;
-  }
-
-  if (isPollMode()) {
-    if (messageBuffer.length >= BUFFER_LIMIT) {
-      const dropped = messageBuffer.shift();
-      log.warn({ event: "buffer_overflow", droppedSeq: dropped?.seq, limit: BUFFER_LIMIT }, "buffer full — dropped oldest");
-    }
-    const ts = new Date().toISOString();
-    messageBuffer.push({
-      seq: -connStateSeq,
-      source: "wire-system",
-      topic: "wire.connection_state",
-      content,
-      ts,
-      metadata: { state: newState, detail: detail ?? null },
-    });
-    log.info({ event: "conn_state_buffered", state: newState, detail }, "connection state change buffered for poll");
-    return;
-  }
-
-  void mcp.notification({
-    method: "notifications/claude/channel" as const,
-    params: {
-      content,
-      meta: {
-        chat_id: "wire:system",
-        message_id: `wire-conn-${connStateSeq}`,
-        user: "wire-system",
-        ts: new Date().toISOString(),
-        seq: String(-connStateSeq),
-        source: "wire-system",
-        topic: "wire.connection_state",
-        created_at: String(Date.now()),
-        state: newState,
-        detail: detail ?? "",
-      },
-    },
-  }).catch((e) =>
-    log.error({ event: "conn_state_notify_failed", err: e }, "failed to inject connection state notification"),
+  // v2.11.0: stop pushing connection-state events into the agent's
+  // channel context entirely. v2.10.0 gated injection on intra-process
+  // clock-gap to suppress macOS-sleep noise, but real-outage flaps
+  // (transient SSE drops where the process stayed awake) still produced
+  // noisy LOST/RESTORED pairs in the agent's conversation that the
+  // operator wanted off — confirmed 2026-05-28 / 29 after a sustained
+  // ~5min-cycle flap left dozens of pairs in Fondant's context.
+  //
+  // The connection state is still logged for observability (mcp-tee'd
+  // stderr lands in ~/.wire/mcp-stderr/wire.log per wire-claude-code
+  // v2.7.0). Reconnects continue happening transparently in the
+  // background — only the channel-side injection is removed.
+  log.info(
+    { event: "conn_state_logged", state: newState, detail, seq: connStateSeq, lastTickAgeMs: Date.now() - lastSelfTick },
+    `connection state ${newState}${detail ? ` (${detail})` : ""}`,
   );
-  log.info({ event: "conn_state_pushed", state: newState, detail }, "connection state change pushed");
 }
 
 function setConnState(newState: "connected" | "disconnected", detail?: string): void {
