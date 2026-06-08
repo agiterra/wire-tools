@@ -97,6 +97,7 @@ export type ConnectionOptions = {
   ccSessionId?: string; // Identifies the Claude Code session (survives SSE reconnects)
   keyPair: { publicKey: string; privateKey: CryptoKey }; // Caller provides the key
   heartbeatInterval?: number; // ms, default 10000
+  workerWatchdogMs?: number; // ms; respawn the Bun SSE worker after this much silence (no liveness ping). Default 90000.
   deliver: DeliverFn;
   onError?: (error: unknown) => void;
   onConnect?: (sessionId: string) => void;
@@ -110,7 +111,26 @@ type DriverToMainMsg =
   | { type: "stream_dead"; reason?: string }
   | { type: "event"; event: WireEvent }
   | { type: "give_up"; reason: string }
+  | { type: "alive" }
   | { type: "log"; level: "debug" | "info" | "warn" | "error" | "fatal"; fields: Record<string, unknown>; msg: string };
+
+type BootMsg = {
+  type: "boot";
+  url: string;
+  agentId: string;
+  agentName: string;
+  ccSessionId?: string;
+  privateKeyB64: string;
+};
+
+// Parent-thread liveness watchdog (Bun Worker path only). The worker posts
+// {type:"alive"} every 15s; if its event loop freezes on Bun's silent-server-
+// close fetch hang, those stop. We respawn the worker after WATCHDOG_SILENCE_MS
+// of total silence — the durable fix for the 2026-06-05 "agent went Wire-dark
+// for 2.75 days, no auto-reconnect" failure (a frozen worker can't run its own
+// read-timeout; only the parent, on a separate thread, can see + recover it).
+const WATCHDOG_SILENCE_MS = 90_000;
+const WATCHDOG_CHECK_MS = 30_000;
 
 // Minimal shape of either a Bun Worker or an inline-SseRunner adapter.
 interface SseDriver {
@@ -131,6 +151,12 @@ export class WireConnection {
   // boot loop has fully exited (clean disconnect HTTP sent). stop() awaits
   // this for symmetry with the Bun worker's 500ms grace.
   private driverDone: Promise<void> | null = null;
+  // Watchdog state (Bun Worker path only): the boot message to replay on a
+  // respawn, the timestamp of the last message received FROM the driver, and
+  // the periodic check timer.
+  private bootMsg: BootMsg | null = null;
+  private lastDriverMsgAt = 0;
+  private watchdog: ReturnType<typeof setInterval> | null = null;
   private bootResolve: ((sessionId: string) => void) | null = null;
   private bootReject: ((err: Error) => void) | null = null;
 
@@ -213,14 +239,8 @@ export class WireConnection {
       // Bun (or any runtime with the Web Worker API) — isolate the streaming
       // fetch in a Worker thread. The 2026-05-07 bug was Bun-specific event-
       // loop starvation; this is the durable fix for that case.
-      const w = new Worker(new URL("./sse-worker.ts", import.meta.url).href);
-      w.onmessage = (ev: MessageEvent<DriverToMainMsg>) => this.handleWorkerMessage(ev.data);
-      w.onerror = (ev: ErrorEvent) => {
-        this.log.error({ event: "worker_error", message: ev.message, filename: ev.filename, lineno: ev.lineno }, "WORKER_ERROR");
-        this.opts.onError?.(new Error(`SSE worker error: ${ev.message}`));
-      };
-      w.postMessage(bootMsg);
-      this.driver = w as unknown as SseDriver;
+      this.bootMsg = bootMsg;
+      this.spawnWorker();
     } else {
       // Node / tsx — no global Worker. Run the SseRunner inline on the main
       // thread. Node's fetch doesn't block the event loop the way Bun's does
@@ -246,6 +266,11 @@ export class WireConnection {
 
     await bootDone;
 
+    // Bun Worker path only: start the parent-thread liveness watchdog now that
+    // the worker is connected. The Node inline path can't freeze the same way
+    // and has no worker to respawn, so it's skipped.
+    if (typeof Worker !== "undefined") this.startWatchdog();
+
     // Heartbeat lives on the main thread now. Its setTimeout queue is no
     // longer starved by streaming fetch in this thread, so it ticks reliably
     // every intervalMs.
@@ -254,6 +279,7 @@ export class WireConnection {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.clearWatchdog();
     if (this.driver) {
       this.driver.postMessage({ type: "stop" });
       if (this.driverDone) {
@@ -275,10 +301,71 @@ export class WireConnection {
     this.sessionId = null;
   }
 
+  // --- Bun SSE worker spawn + liveness watchdog ---
+
+  /**
+   * Spawn (or respawn) the Bun SSE worker from the stored boot message and wire
+   * up its message/error handlers. Resets the watchdog clock so the fresh
+   * worker gets a full silence window to boot + connect.
+   */
+  private spawnWorker(): void {
+    if (!this.bootMsg) return;
+    const w = new Worker(new URL("./sse-worker.ts", import.meta.url).href);
+    w.onmessage = (ev: MessageEvent<DriverToMainMsg>) => this.handleWorkerMessage(ev.data);
+    w.onerror = (ev: ErrorEvent) => {
+      this.log.error({ event: "worker_error", message: ev.message, filename: ev.filename, lineno: ev.lineno }, "WORKER_ERROR");
+      this.opts.onError?.(new Error(`SSE worker error: ${ev.message}`));
+    };
+    w.postMessage(this.bootMsg);
+    this.driver = w as unknown as SseDriver;
+    this.lastDriverMsgAt = Date.now();
+  }
+
+  /**
+   * Parent-thread liveness watchdog. The worker posts {type:"alive"} every 15s;
+   * if its event loop freezes on Bun's silent-server-close fetch hang those
+   * stop (even the in-worker read-timeout can't fire on a frozen loop). After
+   * WATCHDOG_SILENCE_MS with NO driver message, terminate + respawn the worker —
+   * the fresh worker re-registers, reconnects, and replays from last_ack. This
+   * is the recovery the 2026-06-05 2.75-day Wire-dark hang lacked.
+   */
+  private startWatchdog(): void {
+    this.clearWatchdog();
+    this.lastDriverMsgAt = Date.now();
+    const silenceMs = this.opts.workerWatchdogMs ?? WATCHDOG_SILENCE_MS;
+    // Check a few times per silence window (>=50ms floor so tests stay fast).
+    const checkMs = Math.min(WATCHDOG_CHECK_MS, Math.max(50, Math.floor(silenceMs / 3)));
+    this.watchdog = setInterval(() => {
+      if (this.stopped || !this.driver) return;
+      const silentMs = Date.now() - this.lastDriverMsgAt;
+      if (silentMs <= silenceMs) return;
+      this.log.error(
+        { event: "sse_worker_dark", silentMs },
+        `SSE worker silent ${Math.round(silentMs / 1000)}s — respawning frozen worker`,
+      );
+      this.streamLive = false;
+      try { this.driver.terminate(); } catch { /* already dead */ }
+      this.driver = null;
+      this.spawnWorker();
+    }, checkMs);
+  }
+
+  private clearWatchdog(): void {
+    if (this.watchdog) {
+      clearInterval(this.watchdog);
+      this.watchdog = null;
+    }
+  }
+
   // --- Driver message dispatch (Bun worker or inline SseRunner) ---
 
   private handleWorkerMessage(msg: DriverToMainMsg): void {
+    // Any message from the driver — including the periodic {type:"alive"} ping —
+    // is proof the worker's event loop is running. Feeds the watchdog.
+    this.lastDriverMsgAt = Date.now();
     switch (msg.type) {
+      case "alive":
+        return;
       case "stream_live": {
         const wasFirstConnect = this.bootResolve != null;
         this.sessionId = msg.sessionId;

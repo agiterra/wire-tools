@@ -30,6 +30,15 @@ declare const self: {
 
 const runner = new SseRunner((msg: SseRunnerOutMsg) => self.postMessage(msg));
 
+// Liveness ping to the parent (connection.ts). If Bun's streaming fetch wedges
+// this worker's event loop — the silent-server-close hang where reader.read()
+// never returns and even in-worker timers stop firing (observed: 0 CPU, no
+// output, the 300s read-timeout never fires) — these pings STOP. The parent
+// runs on a separate, unaffected thread, sees the silence, and respawns the
+// worker. A frozen loop can't self-rescue; only the parent can. Interval is
+// well under the parent's silence threshold so a few are missed before action.
+const liveness = setInterval(() => self.postMessage({ type: "alive" }), 15_000);
+
 self.onmessage = (ev) => {
   const data = ev.data as { type?: string } & Record<string, unknown>;
   if (data?.type === "boot") {
@@ -37,6 +46,7 @@ self.onmessage = (ev) => {
   } else if (data?.type === "reset") {
     runner.reset();
   } else if (data?.type === "stop") {
+    clearInterval(liveness);
     runner.stop();
   }
 };
