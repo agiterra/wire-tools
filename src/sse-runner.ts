@@ -28,7 +28,7 @@
 
 import { join } from "path";
 import { importPrivateKey, derivePublicKeyB64 } from "./crypto.js";
-import { register, connect, disconnect, type WireEvent } from "./http.js";
+import { register, connect, disconnect, deriveScreenName, type SelfReportFields, type WireEvent } from "./http.js";
 import { parseSSEChunk } from "./sse.js";
 import { retryWithBackoff } from "./reconnect.js";
 
@@ -54,6 +54,27 @@ type PostFn = (msg: SseRunnerOutMsg) => void;
 function stringifyErr(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
+}
+
+/**
+ * Durable self-report fields sourced from THIS process's env, for the agent's
+ * own /agents/register call. Safe only because the SSE runner always registers
+ * itself (callerAgentId === agentId); never reuse for sponsor registration.
+ *
+ *   - ssh_host:   the host this agent runs on, ssh-reachable as tim@<host>.
+ *   - run_as_uid: the per-UID account name (empty/unset for tim-owned spawns).
+ *   - screen_name: derived from $STY (or WIRE_SCREEN_NAME override).
+ *
+ * Each field is omitted from the register body when its env var is empty/unset
+ * (see the `!== undefined` spreads in register()), so an empty WIRE_RUN_AS_UID
+ * sends no run_as_uid rather than "".
+ */
+function selfReportFields(): SelfReportFields {
+  return {
+    ssh_host: process.env.WIRE_SSH_HOST || undefined,
+    run_as_uid: process.env.WIRE_RUN_AS_UID || undefined,
+    screen_name: deriveScreenName(),
+  };
 }
 
 export class SseRunner {
@@ -169,7 +190,7 @@ export class SseRunner {
       async () => {
         if (!this.signingKey) throw new Error("no signing key");
         const pubB64 = await derivePublicKeyB64(this.signingKey);
-        await register(this.url, this.agentId, this.agentId, this.agentName, pubB64, this.signingKey);
+        await register(this.url, this.agentId, this.agentId, this.agentName, pubB64, this.signingKey, selfReportFields());
         if (!this.sessionId) {
           this.sessionId = await connect(this.url, this.agentId, this.signingKey, this.ccSessionId);
         }
@@ -233,7 +254,7 @@ export class SseRunner {
       async () => {
         if (!this.signingKey) throw new Error("no signing key");
         const pubB64 = await derivePublicKeyB64(this.signingKey);
-        await register(this.url, this.agentId, this.agentId, this.agentName, pubB64, this.signingKey);
+        await register(this.url, this.agentId, this.agentId, this.agentName, pubB64, this.signingKey, selfReportFields());
         this.sessionId = await connect(this.url, this.agentId, this.signingKey, this.ccSessionId);
       },
       {

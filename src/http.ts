@@ -35,6 +35,39 @@ async function jwtHeaders(
   };
 }
 
+/**
+ * Derive the GNU-screen session NAME from the STY env var.
+ *
+ * `$STY` is screen's socket id, formatted `<pid>.<name>` (the name itself may
+ * contain dots, e.g. a hostname). The session name is everything after the
+ * first dot. Returns undefined when STY is unset/empty or has no dot.
+ *
+ * Exported as a pure helper so the derivation is unit-testable without
+ * touching the register HTTP path.
+ */
+export function deriveScreenName(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (env.WIRE_SCREEN_NAME) return env.WIRE_SCREEN_NAME;
+  const sty = env.STY;
+  if (!sty) return undefined;
+  const dot = sty.indexOf(".");
+  if (dot < 0) return undefined;
+  const name = sty.slice(dot + 1);
+  return name.length > 0 ? name : undefined;
+}
+
+/**
+ * Durable self-report fields: where/as-whom the agent runs, for the
+ * dashboard and operator-attach. Only populated for SELF-registration
+ * (callerAgentId === newAgentId) — see selfReportFields() in sse-runner.ts.
+ * For SPONSOR registration these MUST be omitted, or the sponsor's own
+ * host/uid/screen would be stamped onto the sponsored agent.
+ */
+export type SelfReportFields = {
+  ssh_host?: string;
+  run_as_uid?: string;
+  screen_name?: string;
+};
+
 export async function register(
   url: string,
   callerAgentId: string,
@@ -42,13 +75,18 @@ export async function register(
   displayName: string,
   publicKey: string,
   signingKey: CryptoKey,
-  options?: { force_rotate?: boolean },
+  options?: { force_rotate?: boolean } & SelfReportFields,
 ): Promise<void> {
   const body = JSON.stringify({
     id: newAgentId,
     display_name: displayName,
     pubkey: publicKey,
     ...(options?.force_rotate ? { force_rotate: true } : {}),
+    // Self-report fields — omit when undefined so the gateway's "optional"
+    // contract holds (it COALESCEs, but a clean payload sends no nulls).
+    ...(options?.ssh_host !== undefined ? { ssh_host: options.ssh_host } : {}),
+    ...(options?.run_as_uid !== undefined ? { run_as_uid: options.run_as_uid } : {}),
+    ...(options?.screen_name !== undefined ? { screen_name: options.screen_name } : {}),
   });
   const res = await fetch(`${url}/agents/register`, {
     method: "POST",
