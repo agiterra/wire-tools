@@ -33,7 +33,6 @@ import {
   type DeliveryPayload,
   type KeyPair,
 } from "./index.js";
-import { detectTerminalTransport, type TerminalTransport } from "./terminal-transport/index.js";
 
 function titleCase(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
@@ -99,43 +98,6 @@ type BufferedMessage = {
 };
 const messageBuffer: BufferedMessage[] = [];
 const BUFFER_LIMIT = 200;
-
-// Terminal-multiplexer push transport for poll-mode clients (codex, etc.).
-// Probed once at startup; null if no multiplexer was detected.
-// See src/terminal-transport/ for the design.
-let pushTransport: TerminalTransport | null = null;
-
-function formatPushPrompt(source: string, topic: string, content: string, seq: number): string {
-  // Concise framing so the agent recognizes this as an inbound Wire message
-  // rather than free-form operator input. Stays within a few lines so it
-  // doesn't dominate the next turn.
-  //
-  // `content` for webhook-wrapped messages is the FULL envelope JSON
-  // (including headers with auth tokens) — way too much, and a security
-  // hazard if it lands in a user-facing screen. Extract just the
-  // user-visible text from the envelope's payload, falling back to the
-  // raw content for non-webhook channels.
-  let userText = content;
-  try {
-    const parsed = JSON.parse(content);
-    if (parsed && typeof parsed === "object") {
-      // Strip auth-bearing headers if present, regardless of which
-      // shape we end up rendering.
-      const payload = parsed.payload ?? parsed;
-      if (typeof payload === "string") {
-        userText = payload;
-      } else if (payload && typeof payload === "object") {
-        userText = (payload.text as string)
-          ?? (payload.body as string)
-          ?? (payload.message as string)
-          ?? JSON.stringify(payload);
-      }
-    }
-  } catch {
-    // Not JSON — use as-is.
-  }
-  return `[Wire ${topic} from ${source} (seq ${seq})]\n${userText}`;
-}
 
 // --- Connection state notifications ---
 //
@@ -540,9 +502,8 @@ async function deliver(payload: DeliveryPayload): Promise<void> {
   }
 
   if (isPollMode()) {
-    // Buffer first — always — so get_pending_messages stays useful as a
-    // catch-up tool whether or not push delivery worked. Buffer is bounded;
-    // when full we drop oldest with a loud log.
+    // Buffer for the get_pending_messages drain. Bounded; when full we drop
+    // oldest with a loud log.
     if (messageBuffer.length >= BUFFER_LIMIT) {
       const dropped = messageBuffer.shift();
       log.warn({ event: "buffer_overflow", droppedSeq: dropped?.seq, limit: BUFFER_LIMIT }, "buffer full — dropped oldest");
@@ -556,22 +517,14 @@ async function deliver(payload: DeliveryPayload): Promise<void> {
       metadata: channel.metadata as Record<string, unknown>,
     });
 
-    // Push to the agent's stdin via the detected terminal multiplexer
-    // (screen / tmux / cmux / iterm). Real-time delivery to codex agents
-    // and any other poll-mode runtime running inside a multiplexer.
-    // If no transport is active, we already buffered above — agent will
-    // pick up via get_pending_messages.
-    if (pushTransport) {
-      const prompt = formatPushPrompt(String(raw.source), topic, content, raw.seq);
-      const ok = await pushTransport.send(prompt);
-      if (ok) {
-        log.info({ event: "deliver_pushed", seq: raw.seq, source, transport: pushTransport.name }, "pushed via multiplexer");
-      } else {
-        log.warn({ event: "deliver_push_failed", seq: raw.seq, source, transport: pushTransport.name }, "push failed — buffered for poll");
-      }
-    } else {
-      log.info({ event: "deliver_buffered", seq: raw.seq, source, depth: messageBuffer.length }, "buffered for poll");
-    }
+    // Poll-mode runtimes (codex etc.) drain this buffer via the
+    // get_pending_messages tool on their heartbeat. The old real-time path
+    // typed the message into the agent's TUI via screen/tmux `stuff`; that
+    // was removed — it raced codex's TUI state (keystrokes piled behind a
+    // transcript replay and never fired a turn). Codex now receives turns
+    // through the Codex Server (app-server) injection path, not TTY
+    // keystrokes.
+    log.info({ event: "deliver_buffered", seq: raw.seq, source, depth: messageBuffer.length }, "buffered for poll");
     return;
   }
 
@@ -609,14 +562,6 @@ export async function startServer(): Promise<void> {
     process.exit(1);
   }
 
-  // Probe for a terminal-multiplexer push transport. If we find one,
-  // poll-mode delivery (codex etc.) becomes effectively real-time.
-  pushTransport = detectTerminalTransport();
-  if (pushTransport) {
-    log.info({ event: "push_transport_active", transport: pushTransport.name }, `push delivery via ${pushTransport.name}`);
-  } else {
-    log.info({ event: "push_transport_none" }, "no multiplexer detected — poll-mode clients rely on get_pending_messages");
-  }
   keyPair = await importKeyPair(rawKey);
 
   // Connect MCP first so notifications work when SSE backlog arrives
