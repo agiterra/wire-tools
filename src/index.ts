@@ -25,4 +25,10 @@ export { parseSSEChunk } from "./sse.js";
 export { retryWithBackoff } from "./reconnect.js";
 
 // MCP server (shared by claude-code and codex adapters)
-export { startServer } from "./mcp-server.js";
+export {
+  startServer,
+  createWireMcpServer,
+  registerWireTools,
+  type WireToolsContext,
+  type WireMcpInbound,
+} from "./mcp-server.js";
