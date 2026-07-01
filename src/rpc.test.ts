@@ -125,6 +125,29 @@ describe("webhook-ingress topic prefix tolerance", () => {
   });
 });
 
+describe("stringified payloads (broker SSE delivery shape)", () => {
+  test("roundtrip works when frames carry JSON-string payloads", async () => {
+    let seq = 0;
+    let responder: RpcResponder;
+    const client = new RpcClient({
+      url: "http://x", agentId: "requester", signingKey: KEY,
+      send: async (topic, payload, dest) => {
+        await responder.handleEvent({ seq: ++seq, source: "requester", topic: `webhook.${topic}`, payload: JSON.stringify(payload), dest, created_at: 0 });
+        return { seq };
+      },
+    });
+    responder = new RpcResponder({
+      url: "http://x", agentId: "responder", signingKey: KEY, log: () => {},
+      methods: { echo: (p) => p },
+      send: async (topic, payload, dest) => {
+        client.handleEvent({ seq: ++seq, source: "responder", topic: `webhook.${topic}`, payload: JSON.stringify(payload), dest, created_at: 0 });
+        return { seq };
+      },
+    });
+    expect(await client.request("responder", "echo", { deep: ["ok"] })).toEqual({ deep: ["ok"] });
+  });
+});
+
 describe("frame pass-through (composability with normal delivery)", () => {
   test("client ignores non-reply topics and replies with unknown ids", () => {
     const client = new RpcClient({ url: "http://x", agentId: "a", signingKey: KEY, send: async () => ({ seq: 1 }) });

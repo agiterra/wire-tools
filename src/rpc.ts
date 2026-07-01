@@ -42,6 +42,20 @@ function normalizeTopic(topic: string): string {
   return topic.startsWith("webhook.") ? topic.slice("webhook.".length) : topic;
 }
 
+/**
+ * Frame payloads arrive as JSON STRINGS over the broker's SSE path (the
+ * router stringifies before delivery) but as objects from in-process test
+ * wiring. Accept both; a non-JSON string is simply not an RPC payload.
+ */
+function parsePayload(payload: unknown): unknown {
+  if (typeof payload !== "string") return payload;
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return undefined;
+  }
+}
+
 export type RpcRequestPayload = {
   rpc: { id: string; reply_to: string; reply_topic: string };
   method: string;
@@ -145,7 +159,7 @@ export class RpcClient {
    */
   handleEvent(event: WireEvent): boolean {
     if (normalizeTopic(event.topic) !== this.replyTopic) return false;
-    const payload = event.payload as RpcReplyPayload | undefined;
+    const payload = parsePayload(event.payload) as RpcReplyPayload | undefined;
     const id = payload?.rpc?.id;
     if (!id) return false;
     const p = this.pending.get(id);
@@ -193,7 +207,7 @@ export class RpcResponder {
    */
   async handleEvent(event: WireEvent): Promise<boolean> {
     if (normalizeTopic(event.topic) !== RPC_REQUEST_TOPIC) return false;
-    const payload = event.payload as RpcRequestPayload | undefined;
+    const payload = parsePayload(event.payload) as RpcRequestPayload | undefined;
     const rpc = payload?.rpc;
     if (!rpc?.id || !rpc.reply_to || !payload?.method) return false;
 
