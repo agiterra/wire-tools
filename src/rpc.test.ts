@@ -148,6 +148,31 @@ describe("stringified payloads (broker SSE delivery shape)", () => {
   });
 });
 
+describe("webhook delivery envelope (real broker shape)", () => {
+  test("roundtrip unwraps {headers, payload: <inner-string>} envelopes", async () => {
+    let seq = 0;
+    let responder: RpcResponder;
+    const envelope = (source: string, topic: string, payload: unknown, dest: string) =>
+      JSON.stringify({ source, topic: `webhook.${topic}`, dest, plugin: "rpc", headers: { host: "x" }, payload: JSON.stringify(payload) });
+    const client = new RpcClient({
+      url: "http://x", agentId: "requester", signingKey: KEY,
+      send: async (topic, payload, dest) => {
+        await responder.handleEvent({ seq: ++seq, source: "requester", topic: `webhook.${topic}`, payload: envelope("requester", topic, payload, dest), dest, created_at: 0 });
+        return { seq };
+      },
+    });
+    responder = new RpcResponder({
+      url: "http://x", agentId: "responder", signingKey: KEY, log: () => {},
+      methods: { echo: (p) => p },
+      send: async (topic, payload, dest) => {
+        client.handleEvent({ seq: ++seq, source: "responder", topic: `webhook.${topic}`, payload: envelope("responder", topic, payload, dest), dest, created_at: 0 });
+        return { seq };
+      },
+    });
+    expect(await client.request("responder", "echo", { nested: true })).toEqual({ nested: true });
+  });
+});
+
 describe("frame pass-through (composability with normal delivery)", () => {
   test("client ignores non-reply topics and replies with unknown ids", () => {
     const client = new RpcClient({ url: "http://x", agentId: "a", signingKey: KEY, send: async () => ({ seq: 1 }) });

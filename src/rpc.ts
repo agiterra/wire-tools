@@ -56,6 +56,25 @@ function parsePayload(payload: unknown): unknown {
   }
 }
 
+/**
+ * Webhook-ingress frames wrap the sender's payload in a delivery envelope
+ * ({source, topic, plugin, headers, payload: <inner JSON string>}) — the
+ * actual RPC payload is one level down, stringified again. Unwrap when the
+ * shape says envelope; pass through otherwise.
+ */
+function framePayload(event: WireEvent): unknown {
+  let p = parsePayload(event.payload);
+  if (
+    p !== null &&
+    typeof p === "object" &&
+    "payload" in (p as Record<string, unknown>) &&
+    "headers" in (p as Record<string, unknown>)
+  ) {
+    p = parsePayload((p as Record<string, unknown>).payload);
+  }
+  return p;
+}
+
 export type RpcRequestPayload = {
   rpc: { id: string; reply_to: string; reply_topic: string };
   method: string;
@@ -159,7 +178,7 @@ export class RpcClient {
    */
   handleEvent(event: WireEvent): boolean {
     if (normalizeTopic(event.topic) !== this.replyTopic) return false;
-    const payload = parsePayload(event.payload) as RpcReplyPayload | undefined;
+    const payload = framePayload(event) as RpcReplyPayload | undefined;
     const id = payload?.rpc?.id;
     if (!id) return false;
     const p = this.pending.get(id);
@@ -207,7 +226,7 @@ export class RpcResponder {
    */
   async handleEvent(event: WireEvent): Promise<boolean> {
     if (normalizeTopic(event.topic) !== RPC_REQUEST_TOPIC) return false;
-    const payload = parsePayload(event.payload) as RpcRequestPayload | undefined;
+    const payload = framePayload(event) as RpcRequestPayload | undefined;
     const rpc = payload?.rpc;
     if (!rpc?.id || !rpc.reply_to || !payload?.method) return false;
 
