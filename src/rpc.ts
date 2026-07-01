@@ -32,6 +32,16 @@ import { sendSignedMessage } from "./http.js";
 export const RPC_REQUEST_TOPIC = "rpc.request";
 export const RPC_REPLY_TOPIC = "rpc.reply";
 
+/**
+ * The broker's webhook ingress prefixes delivered topics with "webhook."
+ * (a send to /webhooks/<dest>/rpc.request arrives as topic
+ * "webhook.rpc.request"). Match on the normalized form so RPC works over
+ * both webhook-ingress unicast and any unprefixed delivery path.
+ */
+function normalizeTopic(topic: string): string {
+  return topic.startsWith("webhook.") ? topic.slice("webhook.".length) : topic;
+}
+
 export type RpcRequestPayload = {
   rpc: { id: string; reply_to: string; reply_topic: string };
   method: string;
@@ -134,7 +144,7 @@ export class RpcClient {
    * path handle it.
    */
   handleEvent(event: WireEvent): boolean {
-    if (event.topic !== this.replyTopic) return false;
+    if (normalizeTopic(event.topic) !== this.replyTopic) return false;
     const payload = event.payload as RpcReplyPayload | undefined;
     const id = payload?.rpc?.id;
     if (!id) return false;
@@ -182,7 +192,7 @@ export class RpcResponder {
    * (consumed — a reply has been sent, including for errors/refusals).
    */
   async handleEvent(event: WireEvent): Promise<boolean> {
-    if (event.topic !== RPC_REQUEST_TOPIC) return false;
+    if (normalizeTopic(event.topic) !== RPC_REQUEST_TOPIC) return false;
     const payload = event.payload as RpcRequestPayload | undefined;
     const rpc = payload?.rpc;
     if (!rpc?.id || !rpc.reply_to || !payload?.method) return false;
