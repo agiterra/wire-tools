@@ -84,13 +84,18 @@ export async function register(
   displayName: string,
   publicKey: string,
   signingKey: CryptoKey,
-  options?: { force_rotate?: boolean } & SelfReportFields,
+  options?: { force_rotate?: boolean; permanent?: boolean; kind?: "agent" | "integration" } & SelfReportFields,
 ): Promise<void> {
   const body = JSON.stringify({
     id: newAgentId,
     display_name: displayName,
     pubkey: publicKey,
     ...(options?.force_rotate ? { force_rotate: true } : {}),
+    // Identity class — omit when undefined (broker defaults: ephemeral agent).
+    // Services (crew-svc, wallet) enroll as permanent integrations so a reap
+    // never purges their webhooks/dependents.
+    ...(options?.permanent !== undefined ? { permanent: options.permanent } : {}),
+    ...(options?.kind !== undefined ? { kind: options.kind } : {}),
     // Self-report fields — omit when undefined so the gateway's "optional"
     // contract holds (it COALESCEs, but a clean payload sends no nulls).
     ...(options?.ssh_host !== undefined ? { ssh_host: options.ssh_host } : {}),
@@ -144,7 +149,7 @@ export async function registerOrRefresh(
   callerSigningKey: CryptoKey,
   newAgentId: string,
   displayName: string,
-  options?: { pubkey?: string; force_rotate?: boolean },
+  options?: { pubkey?: string; force_rotate?: boolean; permanent?: boolean; kind?: "agent" | "integration" },
 ): Promise<RegisterOrRefreshResult> {
   const providedPubkey = options?.pubkey;
   const forceRotate = options?.force_rotate === true;
@@ -187,7 +192,11 @@ export async function registerOrRefresh(
     displayName,
     pubkey,
     callerSigningKey,
-    forceRotate ? { force_rotate: true } : undefined,
+    {
+      ...(forceRotate ? { force_rotate: true } : {}),
+      ...(options?.permanent !== undefined ? { permanent: options.permanent } : {}),
+      ...(options?.kind !== undefined ? { kind: options.kind } : {}),
+    },
   );
 
   return { agentId: newAgentId, displayName, pubkey, privateKey, mode: mode! };
