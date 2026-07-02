@@ -568,6 +568,14 @@ export function createWireMcpServer(opts: {
     const { raw, channel } = payload;
     const topic = canonicalTopic(raw.topic);
     if (topic === "wire.keepalive") return;
+    // rpc.request/rpc.reply are wire-tools' OWN request/response protocol
+    // (RpcClient/RpcResponder), not channel messages. When an in-session RPC
+    // client shares this agent's identity (e.g. bridge's crew.agent_spawn under
+    // the persona's key), the broker fans the reply to EVERY session of the
+    // agent — including this channel feed. Drop it here so the persona never
+    // sees a raw rpc frame as a notification; the RPC participant's own
+    // connection handles it. See [[reference-wireattach-clicktoattach]] sibling.
+    if (topic === "rpc.request" || topic === "rpc.reply") return;
     if (inbound === "none") return; // inbound is handled by the host (e.g. turn injection)
     const source = (channel.metadata.source as string) ?? raw.source;
     const ts = new Date(raw.created_at).toISOString();
@@ -625,6 +633,15 @@ async function deliver(payload: DeliveryPayload): Promise<void> {
   // resets the silence-timeout), but we should NOT dispatch it to the
   // agent's channel — it carries no information for the agent.
   if (topic === "wire.keepalive") {
+    return;
+  }
+
+  // rpc.request/rpc.reply are wire-tools' own RPC protocol frames, not channel
+  // messages — an in-session RPC client sharing this agent's identity (e.g.
+  // bridge → crew.agent_spawn) has its reply fanned to this channel feed too.
+  // Drop so the persona never sees a raw rpc frame; the RPC participant's own
+  // connection handles it.
+  if (topic === "rpc.request" || topic === "rpc.reply") {
     return;
   }
 
