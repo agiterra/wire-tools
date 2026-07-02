@@ -21,6 +21,15 @@ export type WireEvent = {
   payload: unknown;
   dest?: string | null;
   created_at: number;
+  /**
+   * Ed25519 pubkey the BROKER verified the sender's JWT against (wire ≥1.18.0,
+   * Change A). Present ONLY on frames delivered to config-declared server-plugin
+   * identities, and only when the message entered via JWT-verified ingress on
+   * the local broker — forwarded (federated) and operator/server-internal
+   * frames carry none. This is the write-authorization signal for server
+   * plugins: absent ⇒ the sender was NOT locally verified ⇒ refuse writes.
+   */
+  source_pubkey?: string | null;
 };
 
 async function jwtHeaders(
