@@ -55,6 +55,33 @@ describe("WireConnection — frozen-worker watchdog", () => {
     expect(conn.lastDriverMsgAt).toBeGreaterThan(0);
   });
 
+  test("reconnect() drops the session and signals the driver to reset", () => {
+    const conn = makeConn();
+    const posted: unknown[] = [];
+    conn.driver = { postMessage(m: unknown) { posted.push(m); }, terminate() {} };
+    conn.streamLive = true;
+    conn.sessionId = "stale-session";
+    conn.reconnect("test");
+    expect(conn.streamLive).toBe(false);
+    expect(conn.sessionId).toBe(null);
+    expect(posted).toEqual([{ type: "reset" }]);
+  });
+
+  test("reconnect() is a no-op with no driver (dead process can't self-heal)", () => {
+    const conn = makeConn();
+    conn.driver = null;
+    expect(() => conn.reconnect("test")).not.toThrow();
+  });
+
+  test("reconnect() is a no-op once stopped", () => {
+    const conn = makeConn();
+    const posted: unknown[] = [];
+    conn.driver = { postMessage(m: unknown) { posted.push(m); }, terminate() {} };
+    conn.stopped = true;
+    conn.reconnect("test");
+    expect(posted).toEqual([]);
+  });
+
   test("a stopped connection never respawns", async () => {
     const conn = makeConn(80);
     let respawned = 0;

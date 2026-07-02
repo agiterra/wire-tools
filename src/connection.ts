@@ -301,6 +301,30 @@ export class WireConnection {
     this.sessionId = null;
   }
 
+  /**
+   * Force a full re-establish of the inbound SSE from the last acked event.
+   *
+   * Drops the current (possibly-stale) session, aborts the in-flight read, and
+   * signals the driver to re-register + reconnect — which replays the broker's
+   * unacked backlog for this cc_session. Same machinery the heartbeat uses on a
+   * server-purged session (`reset`), exposed as an explicit prod so an external
+   * liveness watchdog can guarantee a fresh stream after a context compaction
+   * (see wire-claude-code SessionStart:compact hook → SIGHUP).
+   *
+   * No-op if stopped or if no driver is running (a dead MCP process can't
+   * reconnect itself — that case needs the process respawned, e.g. /plugin).
+   */
+  reconnect(reason = "manual"): void {
+    if (this.stopped || !this.driver) {
+      this.log.warn({ event: "reconnect_skipped", reason, stopped: this.stopped, hasDriver: !!this.driver }, "reconnect requested but no live driver");
+      return;
+    }
+    this.log.warn({ event: "reconnect_forced", reason }, `forced reconnect (${reason})`);
+    this.streamLive = false;
+    this.sessionId = null;
+    this.driver.postMessage({ type: "reset" });
+  }
+
   // --- Bun SSE worker spawn + liveness watchdog ---
 
   /**

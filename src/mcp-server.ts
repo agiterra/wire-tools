@@ -718,6 +718,12 @@ export async function startServer(): Promise<void> {
           url: WIRE_URL,
           pid: process.pid,
           ccPid: process.ppid > 1 ? process.ppid : null,
+          // Capabilities this server advertises to external watchdogs. The
+          // SessionStart:compact reconnect hook only signals a pid whose
+          // session file lists "sighup-reconnect" — so a hook can't kill an
+          // older server that lacks the SIGHUP handler (default SIGHUP action
+          // is terminate). Deploy-order-safe under wire-tools version skew.
+          caps: ["sighup-reconnect"],
         }));
       } catch (e) {
         log.error({ event: "session_file_write_failed", path: sessionFile, err: e }, "failed to write session file");
@@ -753,22 +759,43 @@ export async function startServer(): Promise<void> {
     }
   }
 
-  const cleanup = async () => {
+  // SIGHUP → force a fresh inbound SSE + broker backlog replay, WITHOUT tearing
+  // the process down. The SessionStart:compact watchdog hook (wire-claude-code)
+  // sends this so a compaction always leaves the agent on a known-good stream,
+  // rather than waiting on the in-process silence watchdog to notice staleness.
+  // A handler MUST exist: the default SIGHUP disposition is to terminate, which
+  // is why the hook only signals servers whose session file advertises the
+  // "sighup-reconnect" cap (written above).
+  process.on("SIGHUP", () => {
+    log.warn({ event: "sighup_reconnect" }, "SIGHUP received — forcing Wire reconnect");
+    conn.reconnect("sighup");
+  });
+
+  // Every exit path logs its trigger before shutting down. Previously stdin
+  // end/close exited SILENTLY (no log), so the ~11h "wire-deaf after compaction"
+  // failures left zero trace of WHICH path killed the process. Never swallow an
+  // exit — log the reason so the fleet can see it (mcp-tee'd to
+  // ~/.wire/mcp-stderr/wire.log).
+  let shuttingDown = false;
+  const cleanup = async (reason: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.warn({ event: "shutdown", reason, agentId: AGENT_ID, pid: process.pid }, `shutting down (${reason})`);
     try { unlinkSync(sessionFile); } catch {}
     await conn.stop();
     process.exit(0);
   };
-  process.on("SIGTERM", cleanup);
-  process.on("SIGINT", cleanup);
-  process.stdin.on("end", cleanup);
-  process.stdin.on("close", cleanup);
+  process.on("SIGTERM", () => cleanup("SIGTERM"));
+  process.on("SIGINT", () => cleanup("SIGINT"));
+  process.stdin.on("end", () => cleanup("stdin_end"));
+  process.stdin.on("close", () => cleanup("stdin_close"));
 
   // Orphan detection: if Claude Code dies, we get reparented to PID 1
   const parentPid = process.ppid;
   setInterval(() => {
     if (process.ppid !== parentPid) {
       log.info({ event: "orphaned", parentPid, newPpid: process.ppid }, "parent died, exiting");
-      cleanup();
+      cleanup("orphaned");
     }
   }, 5000);
 }
