@@ -17,7 +17,7 @@ describe("createWireMcpServer tool surface", () => {
   test("inbound:'none' exposes control tools but NOT get_pending_messages (inbound is via turn injection)", async () => {
     const { client } = await connectedClient("none");
     const names = (await client.listTools()).tools.map((t) => t.name).sort();
-    expect(names).toEqual(["heartbeat_create", "heartbeat_delete", "heartbeat_list", "register_agent", "set_plan"]);
+    expect(names).toEqual(["heartbeat_create", "heartbeat_delete", "heartbeat_list", "register_agent", "set_plan", "webhook_filter_get", "webhook_filter_set", "webhook_list"]);
     expect(names).not.toContain("get_pending_messages");
   });
 
