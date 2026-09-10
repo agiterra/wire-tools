@@ -35,6 +35,8 @@ import {
   importKeyPair,
   setPlan,
   registerOrRefresh,
+  listWebhooks,
+  setWebhookFilter,
   createAuthJwt,
   type DeliveryPayload,
   type KeyPair,
@@ -332,6 +334,86 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
           additionalProperties: false,
         },
       },
+      {
+        name: "webhook_list",
+        description:
+          "List YOUR OWN webhooks on the Wire, with the filter expression each one is running.\n\n" +
+          "Agent-scoped by construction: this calls the gateway under your own AGENT_ID " +
+          "(your JWT identity), so it can only ever return your rows. Each entry has " +
+          "{ id, agent_id, plugin, name, filter, dedup, created_at, meta }. `filter` is a JS " +
+          "expression evaluated over { headers, payload } for every inbound delivery — the " +
+          "webhook is delivered when it returns truthy. `filter: null` means UNFILTERED: the " +
+          "webhook receives everything.\n\n" +
+          "Secrets are never returned — no HMAC secret, no validator, no cleanup code, and " +
+          "secret-looking keys are stripped out of `meta`.\n\n" +
+          "Use the `id` from here with webhook_filter_get / webhook_filter_set.\n\n" +
+          "GOVERNANCE: filtering is for TRUE noise only. Receiving system signals by default is the norm on this fleet — filtering them out is an antipattern (doctrine receive-system-signals-default-filtering-them-is-an-antipattern). Narrow a firehose that is genuinely drowning your context; do not filter away signals because they are inconvenient to read.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "webhook_filter_get",
+        description:
+          "Read the filter expression on ONE of your own webhooks, by webhook id (from webhook_list).\n\n" +
+          "A filter is a JS expression over { headers, payload } — the inbound envelope — and the " +
+          "delivery happens when it returns truthy. `filter: null` means the webhook is UNFILTERED " +
+          "and receives everything.\n\n" +
+          "Agent-scoped by construction: it asks only for your own rows. A webhook id that is not " +
+          "yours is reported as not found rather than read.\n\n" +
+          "GOVERNANCE: filtering is for TRUE noise only. Receiving system signals by default is the norm on this fleet — filtering them out is an antipattern (doctrine receive-system-signals-default-filtering-them-is-an-antipattern). Narrow a firehose that is genuinely drowning your context; do not filter away signals because they are inconvenient to read.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            webhook_id: {
+              type: "number",
+              description: "Webhook id, from webhook_list.",
+            },
+          },
+          required: ["webhook_id"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "webhook_filter_set",
+        description:
+          "Set (or CLEAR) the filter on one of your own webhooks. This is how you retune your own " +
+          "inbound noise without anyone hand-editing the gateway database.\n\n" +
+          "`filter` is a JS expression over { headers, payload }, the inbound webhook envelope. It " +
+          "runs on every delivery and the message reaches you when it returns truthy. Examples:\n" +
+          "  payload.action === \"opened\"\n" +
+          "  headers[\"x-github-event\"] === \"pull_request\"\n" +
+          "  payload.pull_request.number === 1355\n\n" +
+          "CLEARING: pass `filter: null` (or an empty string) to remove the filter entirely — a " +
+          "cleared webhook is unfiltered and RECEIVES EVERYTHING. That is the default state and " +
+          "usually the right one.\n\n" +
+          "The gateway compiles and smoke-runs the expression before storing it, and rejects it " +
+          "with the engine's own error text if it will not run. This matters: at delivery time a " +
+          "filter that throws is swallowed and treated as no-match, so a broken expression would " +
+          "otherwise mute the webhook silently while it still looked healthy.\n\n" +
+          "Agent-scoped by construction: it writes only to your own rows, and every change is " +
+          "audited on the gateway (old filter, new filter, who changed it).\n\n" +
+          "GOVERNANCE: filtering is for TRUE noise only. Receiving system signals by default is the norm on this fleet — filtering them out is an antipattern (doctrine receive-system-signals-default-filtering-them-is-an-antipattern). Narrow a firehose that is genuinely drowning your context; do not filter away signals because they are inconvenient to read.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            webhook_id: {
+              type: "number",
+              description: "Webhook id, from webhook_list.",
+            },
+            filter: {
+              type: ["string", "null"],
+              description:
+                "JS expression over { headers, payload }; the delivery happens when it returns truthy. " +
+                "Pass null (or \"\") to clear the filter — a cleared webhook receives everything.",
+            },
+          },
+          required: ["webhook_id", "filter"],
+          additionalProperties: false,
+        },
+      },
     ],
   }));
 
@@ -501,6 +583,101 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
       } catch (e: any) {
         return {
           content: [{ type: "text" as const, text: `heartbeat_list failed: ${e.message}` }],
+          isError: true,
+        };
+      }
+    }
+
+    // --- AGI-103: webhook filter self-service ---
+    //
+    // All three pass ctx.agentId — the caller's own identity, the same one the JWT
+    // is issued under — so they are agent-scoped by construction. There is no
+    // argument that lets an agent aim them at someone else's rows.
+
+    if (req.params.name === "webhook_list") {
+      try {
+        if (!keyPair) throw new Error("not initialized");
+        const webhooks = await listWebhooks(ctx.wireUrl, ctx.agentId, keyPair.privateKey);
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ count: webhooks.length, webhooks }, null, 2) }],
+        };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `webhook_list failed: ${e.message}` }],
+          isError: true,
+        };
+      }
+    }
+
+    if (req.params.name === "webhook_filter_get") {
+      const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+      const webhookId = args.webhook_id;
+      if (typeof webhookId !== "number" || !Number.isInteger(webhookId)) {
+        return {
+          content: [{ type: "text" as const, text: `webhook_filter_get: 'webhook_id' is required (integer, from webhook_list). Got: ${JSON.stringify(webhookId)}.` }],
+          isError: true,
+        };
+      }
+      try {
+        if (!keyPair) throw new Error("not initialized");
+        // Read through the list: it is already scoped to this agent, so a id
+        // that isn't ours simply isn't here — no separate ownership probe.
+        const webhooks = await listWebhooks(ctx.wireUrl, ctx.agentId, keyPair.privateKey);
+        const hook = webhooks.find((w) => w.id === webhookId);
+        if (!hook) {
+          return {
+            content: [{ type: "text" as const, text: `webhook_filter_get: no webhook ${webhookId} belongs to ${ctx.agentId}. Call webhook_list for your ids.` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              webhook_id: hook.id,
+              plugin: hook.plugin,
+              name: hook.name,
+              filter: hook.filter,
+              unfiltered: hook.filter === null,
+            }, null, 2),
+          }],
+        };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `webhook_filter_get failed: ${e.message}` }],
+          isError: true,
+        };
+      }
+    }
+
+    if (req.params.name === "webhook_filter_set") {
+      const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+      const webhookId = args.webhook_id;
+      const filter = args.filter;
+      if (typeof webhookId !== "number" || !Number.isInteger(webhookId)) {
+        return {
+          content: [{ type: "text" as const, text: `webhook_filter_set: 'webhook_id' is required (integer, from webhook_list). Got: ${JSON.stringify(webhookId)}.` }],
+          isError: true,
+        };
+      }
+      if (filter !== null && typeof filter !== "string") {
+        return {
+          content: [{ type: "text" as const, text: `webhook_filter_set: 'filter' must be a JS expression string, or null to clear it. Got: ${JSON.stringify(filter)}.` }],
+          isError: true,
+        };
+      }
+      try {
+        if (!keyPair) throw new Error("not initialized");
+        const result = await setWebhookFilter(ctx.wireUrl, ctx.agentId, webhookId, filter, keyPair.privateKey);
+        const note = result.filter === null
+          ? "filter CLEARED — this webhook now receives everything."
+          : "filter updated.";
+        return {
+          content: [{ type: "text" as const, text: `${note}\n${JSON.stringify(result, null, 2)}` }],
+        };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `webhook_filter_set failed: ${e.message}` }],
           isError: true,
         };
       }

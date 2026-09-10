@@ -351,3 +351,73 @@ export async function sendSignedMessage(
   }
   return (await res.json()) as { seq: number };
 }
+
+// --- Webhook filter self-service (AGI-103) ---
+
+/**
+ * A webhook row as the gateway is willing to show it. Deliberately narrow:
+ * the validator, the HMAC secrets and the cleanup CODE are never returned,
+ * and `meta` has arrived with secret-looking keys stripped at any depth.
+ */
+export type WebhookSummary = {
+  id: number;
+  agent_id: string;
+  plugin: string;
+  name: string;
+  /** JS expression over { headers, payload }. null = unfiltered (receives everything). */
+  filter: string | null;
+  dedup: string | null;
+  created_at: number;
+  meta: unknown;
+};
+
+/**
+ * List the webhooks belonging to `agentId`.
+ *
+ * Agent-scoped at the gateway by the JWT issuer, not by the id in the path:
+ * pass your own AGENT_ID and you get your own rows; pass someone else's and
+ * the gateway answers 403 unless you are the operator.
+ */
+export async function listWebhooks(
+  url: string,
+  agentId: string,
+  signingKey: CryptoKey,
+): Promise<WebhookSummary[]> {
+  const res = await fetch(`${url}/agents/${agentId}/webhooks`, {
+    method: "GET",
+    headers: await jwtHeaders(agentId, "", signingKey),
+  });
+  if (!res.ok) {
+    throw new Error(`Wire webhook_list failed (${res.status}): ${await res.text()}`);
+  }
+  const json = (await res.json()) as { webhooks: WebhookSummary[] };
+  return json.webhooks;
+}
+
+/**
+ * Replace one webhook's filter. `null` clears it, which means the webhook
+ * receives EVERY delivery again.
+ *
+ * The gateway compiles and smoke-runs the expression before storing it and
+ * answers 400 with the engine's error text if it won't run — a filter that
+ * throws at delivery time is swallowed and treated as no-match, so a bad
+ * expression would otherwise mute the webhook silently.
+ */
+export async function setWebhookFilter(
+  url: string,
+  agentId: string,
+  webhookId: number,
+  filter: string | null,
+  signingKey: CryptoKey,
+): Promise<{ webhook_id: number; filter: string | null; previous_filter: string | null }> {
+  const body = JSON.stringify({ filter });
+  const res = await fetch(`${url}/agents/${agentId}/webhooks/${webhookId}`, {
+    method: "PATCH",
+    headers: await jwtHeaders(agentId, body, signingKey),
+    body,
+  });
+  if (!res.ok) {
+    throw new Error(`Wire webhook_filter_set failed (${res.status}): ${await res.text()}`);
+  }
+  return (await res.json()) as { webhook_id: number; filter: string | null; previous_filter: string | null };
+}
