@@ -41,6 +41,9 @@ import {
   type DeliveryPayload,
   type KeyPair,
 } from "./index.js";
+import { ReadyGate, WireNotReadyError, DEFAULT_READY_TIMEOUT_MS } from "./ready-gate.js";
+import { HealthTracker, DEFAULT_HEALTH_INTERVAL_MS } from "./health.js";
+import { classifyThrownWireError, formatWireError } from "./auth-errors.js";
 
 function titleCase(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
@@ -79,6 +82,16 @@ const mcp = new Server(
 );
 
 let keyPair: KeyPair | null = null;
+
+// AGI-96 (a): the MCP tool surface goes live ~2s before conn.start() registers
+// this agent with the gateway (see startServer). Tools await this gate instead
+// of failing with the permanent-sounding "not initialized".
+const readyGate = new ReadyGate();
+
+// AGI-96 (c): periodic proof-of-life so "connected but quiet" is
+// distinguishable from "connected but dark" in ~/.wire/mcp-stderr/wire.log.
+const health = new HealthTracker();
+const HEALTH_INTERVAL_MS = Number(process.env.WIRE_HEALTH_INTERVAL_MS) || DEFAULT_HEALTH_INTERVAL_MS;
 
 /**
  * Inbound delivery mode.
@@ -195,6 +208,12 @@ export type WireToolsContext = {
   isPollMode: () => boolean;
   /** Drain up to `limit` buffered inbound messages (poll mode only). */
   drain: (limit: number) => BufferedMessage[];
+  /**
+   * AGI-96 (a): bounded wait for the Wire connection to be usable. Optional —
+   * hosts that own an already-live connection (the codex injector) omit it and
+   * tools proceed immediately.
+   */
+  waitReady?: (timeoutMs?: number) => Promise<void>;
 };
 
 /**
@@ -418,7 +437,26 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    const keyPair = ctx.getKeyPair();
+    let keyPair = ctx.getKeyPair();
+
+    /**
+     * AGI-96 (a) init-race guard. Wait (bounded) for the Wire connection to
+     * come up, then re-read the key — it may have been installed while we
+     * waited. Replaces `if (!keyPair) throw new Error("not initialized")`,
+     * which told the agent nothing and read as permanent.
+     */
+    const ensureWire = async (): Promise<KeyPair> => {
+      await ctx.waitReady?.();
+      const kp = ctx.getKeyPair();
+      if (!kp) throw new WireNotReadyError("pending", 0, DEFAULT_READY_TIMEOUT_MS);
+      return kp;
+    };
+
+    /** Render a failed Wire call with its auth class + remedy (AGI-96 (b)). */
+    const describeFailure = (op: string, e: unknown): string => {
+      if (e instanceof WireNotReadyError) return `${op} failed: ${e.message}`;
+      return formatWireError(op, classifyThrownWireError(e));
+    };
 
     if (req.params.name === "get_pending_messages") {
       const args = (req.params.arguments ?? {}) as { limit?: number };
@@ -433,14 +471,14 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
     if (req.params.name === "set_plan") {
       const { plan } = req.params.arguments as { plan: string };
       try {
-        if (!keyPair) throw new Error("not initialized");
+        keyPair = await ensureWire();
         await setPlan(ctx.wireUrl, ctx.agentId, plan, keyPair.privateKey);
         return {
           content: [{ type: "text" as const, text: "plan updated" }],
         };
       } catch (e: any) {
         return {
-          content: [{ type: "text" as const, text: `set_plan failed: ${e.message}` }],
+          content: [{ type: "text" as const, text: describeFailure("set_plan", e) }],
           isError: true,
         };
       }
@@ -450,7 +488,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
       const args = req.params.arguments as { agent_id?: string; cron: string; prompt: string };
       const targetAgent = args.agent_id ?? ctx.agentId;
       try {
-        if (!keyPair) throw new Error("not initialized");
+        keyPair = await ensureWire();
         const body = JSON.stringify({
           agent_id: targetAgent,
           cron: args.cron,
@@ -470,7 +508,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
         };
       } catch (e: any) {
         return {
-          content: [{ type: "text" as const, text: `heartbeat_create failed: ${e.message}` }],
+          content: [{ type: "text" as const, text: describeFailure("heartbeat_create", e) }],
           isError: true,
         };
       }
@@ -479,7 +517,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
     if (req.params.name === "heartbeat_delete") {
       const { id } = req.params.arguments as { id: string };
       try {
-        if (!keyPair) throw new Error("not initialized");
+        keyPair = await ensureWire();
         const token = await createAuthJwt(keyPair.privateKey, ctx.agentId, "");
         const res = await fetch(`${ctx.wireUrl}/heartbeats/${id}`, {
           method: "DELETE",
@@ -491,7 +529,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
         };
       } catch (e: any) {
         return {
-          content: [{ type: "text" as const, text: `heartbeat_delete failed: ${e.message}` }],
+          content: [{ type: "text" as const, text: describeFailure("heartbeat_delete", e) }],
           isError: true,
         };
       }
@@ -560,7 +598,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
         };
       } catch (e: any) {
         return {
-          content: [{ type: "text" as const, text: `register_agent failed: ${e.message}` }],
+          content: [{ type: "text" as const, text: describeFailure("register_agent", e) }],
           isError: true,
         };
       }
@@ -569,7 +607,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
     if (req.params.name === "heartbeat_list") {
       const args = req.params.arguments as { agent_id?: string } | undefined;
       try {
-        if (!keyPair) throw new Error("not initialized");
+        keyPair = await ensureWire();
         const url = args?.agent_id
           ? `${ctx.wireUrl}/heartbeats?agent_id=${args.agent_id}`
           : `${ctx.wireUrl}/heartbeats`;
@@ -582,7 +620,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
         };
       } catch (e: any) {
         return {
-          content: [{ type: "text" as const, text: `heartbeat_list failed: ${e.message}` }],
+          content: [{ type: "text" as const, text: describeFailure("heartbeat_list", e) }],
           isError: true,
         };
       }
@@ -596,14 +634,14 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
 
     if (req.params.name === "webhook_list") {
       try {
-        if (!keyPair) throw new Error("not initialized");
+        keyPair = await ensureWire();
         const webhooks = await listWebhooks(ctx.wireUrl, ctx.agentId, keyPair.privateKey);
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ count: webhooks.length, webhooks }, null, 2) }],
         };
       } catch (e: any) {
         return {
-          content: [{ type: "text" as const, text: `webhook_list failed: ${e.message}` }],
+          content: [{ type: "text" as const, text: describeFailure("webhook_list", e) }],
           isError: true,
         };
       }
@@ -619,7 +657,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
         };
       }
       try {
-        if (!keyPair) throw new Error("not initialized");
+        keyPair = await ensureWire();
         // Read through the list: it is already scoped to this agent, so a id
         // that isn't ours simply isn't here — no separate ownership probe.
         const webhooks = await listWebhooks(ctx.wireUrl, ctx.agentId, keyPair.privateKey);
@@ -644,7 +682,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
         };
       } catch (e: any) {
         return {
-          content: [{ type: "text" as const, text: `webhook_filter_get failed: ${e.message}` }],
+          content: [{ type: "text" as const, text: describeFailure("webhook_filter_get", e) }],
           isError: true,
         };
       }
@@ -667,7 +705,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
         };
       }
       try {
-        if (!keyPair) throw new Error("not initialized");
+        keyPair = await ensureWire();
         const result = await setWebhookFilter(ctx.wireUrl, ctx.agentId, webhookId, filter, keyPair.privateKey);
         const note = result.filter === null
           ? "filter CLEARED — this webhook now receives everything."
@@ -677,7 +715,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
         };
       } catch (e: any) {
         return {
-          content: [{ type: "text" as const, text: `webhook_filter_set failed: ${e.message}` }],
+          content: [{ type: "text" as const, text: describeFailure("webhook_filter_set", e) }],
           isError: true,
         };
       }
@@ -696,6 +734,7 @@ registerWireTools(mcp, {
   getKeyPair: () => keyPair,
   isPollMode,
   drain: (limit) => messageBuffer.splice(0, limit),
+  waitReady: (timeoutMs) => readyGate.wait(timeoutMs),
 });
 
 export type WireMcpInbound = "push" | "poll" | "none";
@@ -845,6 +884,7 @@ async function deliver(payload: DeliveryPayload): Promise<void> {
     // transcript replay and never fired a turn). Codex now receives turns
     // through the Codex Server (app-server) injection path, not TTY
     // keystrokes.
+    health.onDelivery(raw.seq, String(source));
     log.info({ event: "deliver_buffered", seq: raw.seq, source, depth: messageBuffer.length }, "buffered for poll");
     return;
   }
@@ -868,8 +908,10 @@ async function deliver(payload: DeliveryPayload): Promise<void> {
     };
     log.debug({ event: "deliver_sending", seq: raw.seq, source }, "sending notification");
     await mcp.notification(notification);
+    health.onDelivery(raw.seq, String(source));
     log.info({ event: "deliver_ok", seq: raw.seq, source }, "delivered");
   } catch (e) {
+    health.onError(e);
     log.error({ event: "deliver_failed", seq: raw.seq, source, err: e }, "notification failed");
   }
 }
@@ -902,6 +944,10 @@ export async function startServer(): Promise<void> {
     keyPair: keyPair!,
     deliver,
     onConnect: (sessionId) => {
+      // AGI-96 (a)/(c): release any tool call waiting on the init race, and
+      // start the health clock for this session.
+      readyGate.markReady();
+      health.onConnect(sessionId);
       log.info({ event: "connected", sseSession: sessionId, ccSession: CC_SESSION_ID }, "connected");
       setConnState("connected", `session ${sessionId.slice(0, 8)}`);
       try {
@@ -924,10 +970,31 @@ export async function startServer(): Promise<void> {
       }
     },
     onDisconnect: () => {
+      // Tools that arrive now should wait for the reconnect rather than be
+      // handed a stale-looking failure.
+      readyGate.markPending();
+      health.onDisconnect();
       log.warn({ event: "disconnected" }, "disconnected, reconnecting...");
       setConnState("disconnected");
     },
-    onError: (e) => log.error({ event: "error", err: e }, "wire error"),
+    onError: (e) => {
+      health.onError(e);
+      // AGI-96 (b): name the auth class so 401/403/404/409 are not all one
+      // undifferentiated "wire error" in the log.
+      const info = classifyThrownWireError(e);
+      log.error(
+        {
+          event: "error",
+          err: e,
+          wireErrorCode: info.code,
+          wireErrorClass: info.class,
+          status: info.status,
+          needsReregister: info.needsReregister,
+          needsSessionReset: info.needsSessionReset,
+        },
+        formatWireError("wire", info),
+      );
+    },
   });
 
   // Register webhook envelope handler for IPC topic
@@ -939,6 +1006,14 @@ export async function startServer(): Promise<void> {
   await new Promise((r) => setTimeout(r, 2000));
 
   await conn.start();
+
+  // AGI-96 (c): from here on the process emits one `wire_health` line
+  // immediately and then every HEALTH_INTERVAL_MS, so an outside watcher can
+  // tell a quiet stream from a dead one without attaching to the process.
+  health.start(
+    (snapshot) => log.info(snapshot, "wire health"),
+    HEALTH_INTERVAL_MS,
+  );
 
   // Publish initial plan if the orchestrator provided one via env. This is the
   // env-driven counterpart to the set_plan tool — lets a spawning agent
@@ -975,6 +1050,10 @@ export async function startServer(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log.warn({ event: "shutdown", reason, agentId: AGENT_ID, pid: process.pid }, `shutting down (${reason})`);
+    // Emit a final health line so every process leaves a last-known state.
+    log.info(health.snapshot(), "wire health (final)");
+    health.stop();
+    readyGate.dispose();
     try { unlinkSync(sessionFile); } catch {}
     await conn.stop();
     process.exit(0);

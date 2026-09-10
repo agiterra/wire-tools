@@ -33,3 +33,8 @@ export {
   type WireToolsContext,
   type WireMcpInbound,
 } from "./mcp-server.js";
+
+// AGI-96: init-race gate, health line, auth-error classification
+export { ReadyGate, WireNotReadyError, DEFAULT_READY_TIMEOUT_MS, type ReadyState } from "./ready-gate.js";
+export { HealthTracker, DEFAULT_HEALTH_INTERVAL_MS, type HealthSnapshot, type WireHealthState } from "./health.js";
+export { classifyWireError, classifyThrownWireError, formatWireError, type WireErrorClass, type WireErrorInfo } from "./auth-errors.js";
