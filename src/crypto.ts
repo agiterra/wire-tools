@@ -88,17 +88,43 @@ export async function hashBody(body: string): Promise<string> {
 }
 
 /**
+ * Default token lifetime, seconds. Comfortably inside the gateway's 300s
+ * max-age window (WIRE_JWT_MAX_AGE_SEC) with room for clock skew, and short
+ * enough that a captured token is worth little.
+ */
+export const DEFAULT_JWT_TTL_SEC = 60;
+
+export type AuthJwtOptions = {
+  /** Override the token lifetime in seconds — e.g. a slow signed upload. */
+  ttlSec?: number;
+};
+
+/**
  * Create a JWT for Wire REST API authentication.
- * Claims: iss (agent ID), iat, body_hash (SHA-256 of request body).
+ * Claims: iss (agent ID), iat, exp, jti, body_hash (SHA-256 of request body).
+ *
+ * AGI-30: `exp` and `jti` are the two claims this used to omit. Without exp a
+ * captured token replayed forever — body_hash bound a replay to the identical
+ * body, but nothing bounded it in time. Without jti the gateway had no way to
+ * spend a token once, and two tokens minted in the same second for the same
+ * body were BYTE-IDENTICAL, so it could not even tell a replay from a retry.
+ *
+ * Additive on the wire: the claims are ignored by a gateway that does not check
+ * them yet, so clients can ship this ahead of the server-side enforcement.
  */
 export async function createAuthJwt(
   privateKey: CryptoKey,
   agentId: string,
   body: string,
+  options: AuthJwtOptions = {},
 ): Promise<string> {
+  const iat = Math.floor(Date.now() / 1000);
+  const ttl = options.ttlSec && options.ttlSec > 0 ? options.ttlSec : DEFAULT_JWT_TTL_SEC;
   const claims = {
     iss: agentId,
-    iat: Math.floor(Date.now() / 1000),
+    iat,
+    exp: iat + ttl,
+    jti: crypto.randomUUID(),
     body_hash: await hashBody(body),
   };
   const payloadB64 = base64urlEncode(
