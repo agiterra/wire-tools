@@ -196,3 +196,32 @@ describe("frame pass-through (composability with normal delivery)", () => {
     expect([a, b, c]).toEqual(["A", "B", "C"]);
   });
 });
+
+describe("malformed rpc request (j:1480)", () => {
+  test("method without rpc envelope gets an error REPLY to the source and runs nothing", async () => {
+    const sent: { topic: string; payload: any; dest?: string }[] = [];
+    let ran = 0;
+    const responder = new RpcResponder({
+      url: "http://x", agentId: "responder", signingKey: KEY, log: () => {},
+      methods: { "crew.agent_stop": async () => { ran++; return { stopped: true }; } },
+      send: async (topic, payload, dest) => { sent.push({ topic, payload, dest }); },
+    });
+    const consumed = await responder.handleEvent({
+      topic: "webhook.rpc.request", source: "brioche",
+      payload: { method: "crew.agent_stop", params: { id: "gulabjamun" } },
+    } as any);
+    expect(consumed).toBe(true);
+    expect(ran).toBe(0);
+    expect(sent.length).toBe(1);
+    expect(sent[0].dest).toBe("brioche");
+    expect(sent[0].payload.ok).toBe(false);
+    expect(String(sent[0].payload.error)).toMatch(/malformed rpc request 'crew.agent_stop'/);
+    expect(String(sent[0].payload.error)).toMatch(/missing rpc.id/);
+  });
+  test("a frame on the rpc topic with no method is still not ours (returns false, sends nothing)", async () => {
+    const sent: unknown[] = [];
+    const responder = new RpcResponder({ url: "http://x", agentId: "responder", signingKey: KEY, log: () => {}, methods: {}, send: async (...a) => { sent.push(a); } });
+    expect(await responder.handleEvent({ topic: "rpc.request", source: "x", payload: { hello: 1 } } as any)).toBe(false);
+    expect(sent.length).toBe(0);
+  });
+});

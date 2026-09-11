@@ -228,7 +228,25 @@ export class RpcResponder {
     if (normalizeTopic(event.topic) !== RPC_REQUEST_TOPIC) return false;
     const payload = framePayload(event) as RpcRequestPayload | undefined;
     const rpc = payload?.rpc;
-    if (!rpc?.id || !rpc.reply_to || !payload?.method) return false;
+    if (!rpc?.id || !rpc.reply_to || !payload?.method) {
+      // 2026-09-11 (j:1480): a frame on the RPC topic that NAMES A METHOD but lacks the rpc envelope is a
+      // caller's mistake, not "not an RPC". Returning false here left crew.agent_stop requests unanswered
+      // (brioche 610686/610692: crew-service logged 'ignored non-rpc frame', no reply, lane stayed alive —
+      // a-bug-that-fails-safe-is-undetectable). Reply with an error to the frame's SOURCE so the caller
+      // learns the shape; nothing is executed. Frames with no method at all are still not ours.
+      if (typeof payload?.method === "string" && event.source) {
+        const missing = !rpc?.id ? "rpc.id" : "rpc.reply_to";
+        const error = `malformed rpc request '${payload.method}': payload must be {rpc:{id,reply_to}, method, params} — missing ${missing}; nothing executed`;
+        this.log(`refused malformed rpc from '${event.source}': ${error}`);
+        try {
+          await this.send(RPC_REPLY_TOPIC, { rpc: { id: rpc?.id ?? null }, ok: false, error }, event.source);
+        } catch (e) {
+          this.log(`malformed-rpc reply send failed → ${event.source}`, e);
+        }
+        return true;
+      }
+      return false;
+    }
 
     const reply = async (body: Omit<RpcReplyPayload, "rpc">) => {
       try {
