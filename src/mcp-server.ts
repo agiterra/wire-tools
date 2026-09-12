@@ -44,6 +44,7 @@ import {
 import { ReadyGate, WireNotReadyError, DEFAULT_READY_TIMEOUT_MS } from "./ready-gate.js";
 import { HealthTracker, DEFAULT_HEALTH_INTERVAL_MS } from "./health.js";
 import { classifyThrownWireError, formatWireError } from "./auth-errors.js";
+import { resolveInboundMode, type InboundMode } from "./inbound-mode.ts";
 
 function titleCase(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
@@ -104,11 +105,12 @@ const HEALTH_INTERVAL_MS = Number(process.env.WIRE_HEALTH_INTERVAL_MS) || DEFAUL
  * `oninitialized` AFTER sending the init response, which races with the
  * client's first tools/list request — lazy resolution avoids the race.
  */
+function inboundMode(): InboundMode {
+  // 2.22.0 (j:1512): explicit env override, then the Grok-bridge flag (→ none), then the client-name heuristic.
+  return resolveInboundMode(process.env, mcp.getClientVersion()?.name).mode;
+}
 function isPollMode(): boolean {
-  const name = (mcp.getClientVersion()?.name ?? "").toLowerCase();
-  // Default to poll for unknowns: silent-drop on push is worse than an
-  // unfamiliar tool surface.
-  return !name.includes("claude");
+  return inboundMode() === "poll";
 }
 
 type BufferedMessage = {
@@ -931,6 +933,26 @@ export async function startServer(): Promise<void> {
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
 
+  // inbound=none (2.22.0, j:1512): this process serves CONTROL TOOLS ONLY. Another process (the wire-grok
+  // sidecar) owns this agent's Wire stream and injects turns; opening a second SSE here made every packet
+  // arrive twice (poll copy, then injection copy — Vacherin, Brioche 612640). No connection, no session
+  // file, no health clock, no buffer, and get_pending_messages is not listed (isPollMode() is false).
+  // Key-only tools (set_plan, heartbeat_*, webhook_*) keep working; the ready gate is opened so they do
+  // not wait on an SSE that will never come.
+  const resolved = resolveInboundMode(process.env, undefined);
+  if (resolved.invalidOverride) log.warn({ event: "inbound_override_invalid", value: resolved.invalidOverride }, "WIRE_MCP_INBOUND has an unknown value — ignored, falling back");
+  if (resolved.mode === "none") {
+    readyGate.markReady();
+    setConnState("connected", "inbound=none (control tools only; sidecar owns the stream)");
+    log.info({ event: "inbound_none", reason: resolved.reason }, "inbound=none — control tools only; no Wire SSE opened by this process");
+    process.on("SIGHUP", () => { log.info({ event: "sighup_ignored", reason: "inbound=none" }, "SIGHUP received — no inbound connection to reconnect"); });
+    const initialPlanNone = process.env.AGENT_PLAN;
+    if (initialPlanNone) {
+      try { await setPlan(WIRE_URL, AGENT_ID, initialPlanNone, keyPair.privateKey); log.info({ event: "initial_plan_published" }, "AGENT_PLAN published"); }
+      catch (e) { log.error({ event: "initial_plan_failed", err: e }, "failed to publish AGENT_PLAN"); }
+    }
+    return;
+  }
   // Session file: lets the SessionEnd hook disconnect this specific session
   const sessionDir = join(process.env.HOME ?? "/tmp", ".wire", "sessions");
   const sessionFile = join(sessionDir, `${AGENT_ID}.${process.pid}.json`);
