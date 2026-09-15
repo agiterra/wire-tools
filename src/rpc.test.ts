@@ -7,7 +7,7 @@ import {
   RpcRemoteError,
   RPC_REQUEST_TOPIC,
   RPC_REPLY_TOPIC,
-} from "./rpc.js";
+  isSafeReplyTopic, } from "./rpc.js";
 
 const KEY = {} as CryptoKey; // never used — send is injected everywhere
 
@@ -218,6 +218,41 @@ describe("malformed rpc request (j:1480)", () => {
     expect(String(sent[0].payload.error)).toMatch(/malformed rpc request 'crew.agent_stop'/);
     expect(String(sent[0].payload.error)).toMatch(/missing rpc.id/);
   });
+  // ---- 2026-09-15: a malformed request's error must be VISIBLE to its sender -----------
+  // RPC_REPLY_TOPIC is dropped by every channel feed (reserved for managed clients whose own
+  // connection resolves it), so malformed errors sent there guaranteed that the callers who
+  // most needed the explanation never saw it.
+  const mkResponder = (sent: any[]) => new RpcResponder({
+    url: "http://x", agentId: "responder", signingKey: KEY, log: () => {},
+    methods: { m: async () => ({ ok: 1 }) },
+    send: async (topic: string, payload: any, dest?: string) => { sent.push({ topic, payload, dest }); },
+  });
+  const malformed = (reply_topic?: unknown) => ({
+    topic: "webhook.rpc.request", source: "brioche",
+    payload: { method: "m", params: {}, rpc: reply_topic === undefined ? {} : { reply_topic } },
+  } as any);
+
+  test("a SAFE supplied reply_topic receives the malformed error", async () => {
+    const sent: any[] = []; await mkResponder(sent).handleEvent(malformed("ipc"));
+    expect(sent[0].topic).toBe("ipc");
+    expect(sent[0].dest).toBe("brioche");
+    expect(sent[0].payload.ok).toBe(false);
+  });
+  test("no reply_topic falls back to the constant", async () => {
+    const sent: any[] = []; await mkResponder(sent).handleEvent(malformed());
+    expect(sent[0].topic).toBe(RPC_REPLY_TOPIC);
+  });
+  test("unsafe reply topics fall back instead of being honoured", async () => {
+    for (const bad of ["wire.keepalive", "webhook.wire.control", "../etc", "a b", "", "x".repeat(65), 42, null, {}]) {
+      const sent: any[] = []; await mkResponder(sent).handleEvent(malformed(bad));
+      expect(sent[0].topic).toBe(RPC_REPLY_TOPIC);
+    }
+  });
+  test("isSafeReplyTopic accepts ordinary names and refuses reserved/odd ones", () => {
+    for (const ok of ["ipc", "rpc.reply.raw", "review-replies", "a1._-"]) expect(isSafeReplyTopic(ok)).toBe(true);
+    for (const no of ["wire.keepalive", "webhook.wire.x", "", " lead", "has space", 1, undefined]) expect(isSafeReplyTopic(no as any)).toBe(false);
+  });
+
   test("a frame on the rpc topic with no method is still not ours (returns false, sends nothing)", async () => {
     const sent: unknown[] = [];
     const responder = new RpcResponder({ url: "http://x", agentId: "responder", signingKey: KEY, log: () => {}, methods: {}, send: async (...a) => { sent.push(a); } });
