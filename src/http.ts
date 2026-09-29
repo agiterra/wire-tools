@@ -202,14 +202,22 @@ export async function registerOrRefresh(
   return { agentId: newAgentId, displayName, pubkey, privateKey, mode: mode! };
 }
 
+/**
+ * Open a session. `auxiliary` marks a helper stream that shares the agent's identity but is not
+ * its conversation (an RPC reply listener): the broker (wire >= 1.19.0) starts it at the head and
+ * never lets its acks advance the agent's replay cursor, so a helper that connects first after a
+ * restart cannot swallow IPC queued for the conversation session (j:1935).
+ */
 export async function connect(
   url: string,
   agentId: string,
   signingKey: CryptoKey,
   ccSessionId?: string,
+  options: { auxiliary?: boolean } = {},
 ): Promise<string> {
-  const payload: Record<string, string> = {};
+  const payload: Record<string, string | boolean> = {};
   if (ccSessionId) payload.cc_session_id = ccSessionId;
+  if (options.auxiliary) payload.auxiliary = true;
   const body = JSON.stringify(payload);
   const res = await fetch(`${url}/agents/connect`, {
     method: "POST",
@@ -219,7 +227,12 @@ export async function connect(
   if (!res.ok) {
     throw new Error(`Wire connect failed (${res.status}): ${await res.text()}`);
   }
-  const data = (await res.json()) as { session_id: string };
+  const data = (await res.json()) as { session_id: string; auxiliary?: boolean };
+  if (options.auxiliary && data.auxiliary !== true) {
+    // An older broker ignores the field: this session WILL advance the agent's replay cursor.
+    log.warn({ event: "auxiliary_not_honoured", agentId, sessionId: data.session_id, ccSessionId },
+      "broker did not confirm auxiliary:true (wire < 1.19.0?) — this helper session can consume the agent's queued backlog");
+  }
   return data.session_id;
 }
 

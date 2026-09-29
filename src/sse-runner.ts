@@ -39,6 +39,7 @@ export type SseRunnerBootMsg = {
   agentId: string;
   agentName: string;
   ccSessionId?: string;
+  auxiliary?: boolean;
   privateKeyB64: string;
 };
 
@@ -82,6 +83,7 @@ export class SseRunner {
   private agentId = "";
   private agentName = "";
   private ccSessionId: string | undefined;
+  private auxiliary = false;
   private signingKey: CryptoKey | null = null;
 
   private sessionId: string | null = null;
@@ -192,7 +194,7 @@ export class SseRunner {
         const pubB64 = await derivePublicKeyB64(this.signingKey);
         await register(this.url, this.agentId, this.agentId, this.agentName, pubB64, this.signingKey, selfReportFields());
         if (!this.sessionId) {
-          this.sessionId = await connect(this.url, this.agentId, this.signingKey, this.ccSessionId);
+          this.sessionId = await connect(this.url, this.agentId, this.signingKey, this.ccSessionId, { auxiliary: this.auxiliary });
         }
       },
       {
@@ -248,6 +250,7 @@ export class SseRunner {
     this.agentId = msg.agentId;
     this.agentName = msg.agentName;
     this.ccSessionId = msg.ccSessionId;
+    this.auxiliary = msg.auxiliary === true;
     this.signingKey = await importPrivateKey(msg.privateKeyB64);
 
     await retryWithBackoff(
@@ -255,7 +258,7 @@ export class SseRunner {
         if (!this.signingKey) throw new Error("no signing key");
         const pubB64 = await derivePublicKeyB64(this.signingKey);
         await register(this.url, this.agentId, this.agentId, this.agentName, pubB64, this.signingKey, selfReportFields());
-        this.sessionId = await connect(this.url, this.agentId, this.signingKey, this.ccSessionId);
+        this.sessionId = await connect(this.url, this.agentId, this.signingKey, this.ccSessionId, { auxiliary: this.auxiliary });
       },
       {
         maxBackoff: 60_000,

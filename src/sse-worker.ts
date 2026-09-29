@@ -11,7 +11,7 @@
  * event loop the way Bun's does, so the worker isolation isn't needed).
  *
  * Protocol — unchanged from v2.3.1:
- *   main → worker: {type:"boot", url, agentId, agentName, ccSessionId?, privateKeyB64}
+ *   main → worker: {type:"boot", url, agentId, agentName, ccSessionId?, auxiliary?, privateKeyB64}
  *   main → worker: {type:"reset"}
  *   main → worker: {type:"stop"}
  *   worker → main: {type:"stream_live", sessionId}
