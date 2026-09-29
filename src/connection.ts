@@ -95,6 +95,9 @@ export type ConnectionOptions = {
   agentId: string;
   agentName: string;
   ccSessionId?: string; // Identifies the Claude Code session (survives SSE reconnects)
+  // Helper stream sharing the agent's identity (e.g. an RPC reply listener), not its conversation.
+  // The broker starts it at the head and never lets its acks move the agent's replay cursor.
+  auxiliary?: boolean;
   keyPair: { publicKey: string; privateKey: CryptoKey }; // Caller provides the key
   heartbeatInterval?: number; // ms, default 10000
   workerWatchdogMs?: number; // ms; respawn the Bun SSE worker after this much silence (no liveness ping). Default 90000.
@@ -120,6 +123,7 @@ type BootMsg = {
   agentId: string;
   agentName: string;
   ccSessionId?: string;
+  auxiliary?: boolean;
   privateKeyB64: string;
 };
 
@@ -226,6 +230,7 @@ export class WireConnection {
       agentId: this.opts.agentId,
       agentName: this.opts.agentName,
       ccSessionId: this.opts.ccSessionId,
+      auxiliary: this.opts.auxiliary === true,
       privateKeyB64,
     };
 
