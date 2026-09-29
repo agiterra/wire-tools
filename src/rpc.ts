@@ -43,6 +43,28 @@ function normalizeTopic(topic: string): string {
 }
 
 /**
+ * Is this a reply topic we are willing to send an ERROR to?
+ *
+ * ⛔ WHY. The malformed-request path below used RPC_REPLY_TOPIC unconditionally, so a caller
+ * that asked for a visible reply topic still got its error on "rpc.reply" — which channel feeds
+ * DROP (mcp-server.ts; codex-wire SKIP_TOPICS), that topic being reserved for managed clients
+ * whose own connection resolves it. Net effect: the callers who most needed to be told what was
+ * wrong with their envelope were the ones guaranteed not to hear it. Measured 2026-09-15.
+ *
+ * But an error path must not become a topic-injection primitive: the request is BY DEFINITION
+ * malformed, so its fields are untrusted. Accept only a plain, short, unreserved topic name;
+ * fall back to the constant otherwise. Routing is unchanged — the malformed reply still goes to
+ * the frame's verified `event.source`, never to an attacker-supplied reply_to.
+ */
+export function isSafeReplyTopic(topic: unknown): topic is string {
+  if (typeof topic !== "string") return false;
+  if (topic.length === 0 || topic.length > 64) return false;
+  if (!/^[a-z0-9][a-z0-9._-]*$/i.test(topic)) return false;
+  if (normalizeTopic(topic).startsWith("wire.")) return false; // broker control namespace
+  return true;
+}
+
+/**
  * Frame payloads arrive as JSON STRINGS over the broker's SSE path (the
  * router stringifies before delivery) but as objects from in-process test
  * wiring. Accept both; a non-JSON string is simply not an RPC payload.
@@ -239,7 +261,10 @@ export class RpcResponder {
         const error = `malformed rpc request '${payload.method}': payload must be {rpc:{id,reply_to}, method, params} — missing ${missing}; nothing executed`;
         this.log(`refused malformed rpc from '${event.source}': ${error}`);
         try {
-          await this.send(RPC_REPLY_TOPIC, { rpc: { id: rpc?.id ?? null }, ok: false, error }, event.source);
+          // Honour a SAFE supplied reply topic so a malformed request's error is visible to
+          // its sender; fall back to the constant when absent or unsafe.
+          const errorTopic = isSafeReplyTopic(rpc?.reply_topic) ? (rpc!.reply_topic as string) : RPC_REPLY_TOPIC;
+          await this.send(errorTopic, { rpc: { id: rpc?.id ?? null }, ok: false, error }, event.source);
         } catch (e) {
           this.log(`malformed-rpc reply send failed → ${event.source}`, e);
         }

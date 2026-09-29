@@ -223,6 +223,24 @@ export type WireToolsContext = {
  * the handlers reach the gateway via signed HTTP, so they need no SSE
  * connection of their own — only `ctx.getKeyPair()` + `ctx.wireUrl`.
  */
+/** heartbeat_list `summary: true` (Brioche 642091): a boot check only compares last_fired against cron, and the full list
+ *  carries every prompt body (one 8 KB prompt was ~4.5k tokens of a persona's boot). Pure, so it is unit-tested. */
+export const HEARTBEAT_PROMPT_PREVIEW = 80;
+export function summarizeHeartbeats(list: unknown, now: number = Date.now()): unknown {
+  if (!Array.isArray(list)) return list;   // an unexpected shape passes through untouched, never silently emptied
+  return list.map((h: any) => {
+    const prompt = typeof h?.prompt === "string" ? h.prompt : "";
+    const fired = typeof h?.last_fired === "number" ? h.last_fired : null;
+    return {
+      id: h?.id, agent_id: h?.agent_id, cron: h?.cron, active: h?.active,
+      last_fired: fired === null ? null : new Date(fired).toISOString(),
+      last_fired_age_s: fired === null ? null : Math.round((now - fired) / 1000),
+      prompt: prompt.length > HEARTBEAT_PROMPT_PREVIEW ? `${prompt.slice(0, HEARTBEAT_PROMPT_PREVIEW)}…` : prompt,
+      prompt_chars: prompt.length,
+    };
+  });
+}
+
 export function registerWireTools(server: Server, ctx: WireToolsContext): void {
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
@@ -289,11 +307,12 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
       },
       {
         name: "heartbeat_list",
-        description: "List all scheduled heartbeats, optionally filtered by agent.",
+        description: "List all scheduled heartbeats, optionally filtered by agent. Cron expressions are evaluated in the BROKER's local time zone (America/New_York on patisserie), not UTC. Pass summary:true for a compact list (id, cron, active, last_fired + its age, first 80 chars of the prompt) — enough to check that each heartbeat is still firing, without every prompt body.",
         inputSchema: {
           type: "object" as const,
           properties: {
             agent_id: { type: "string", description: "Filter by agent ID. Omit to list all." },
+            summary: { type: "boolean", description: "Compact rows: prompt truncated to 80 chars (prompt_chars gives the full length), last_fired as ISO UTC + age in seconds. Default false (full records)." },
           },
         },
       },
@@ -607,7 +626,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
     }
 
     if (req.params.name === "heartbeat_list") {
-      const args = req.params.arguments as { agent_id?: string } | undefined;
+      const args = req.params.arguments as { agent_id?: string; summary?: boolean } | undefined;
       try {
         keyPair = await ensureWire();
         const url = args?.agent_id
@@ -618,7 +637,7 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
         if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
         const list = await res.json();
         return {
-          content: [{ type: "text" as const, text: JSON.stringify(list, null, 2) }],
+          content: [{ type: "text" as const, text: args?.summary ? JSON.stringify(summarizeHeartbeats(list)) : JSON.stringify(list, null, 2) }],
         };
       } catch (e: any) {
         return {
