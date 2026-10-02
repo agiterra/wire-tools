@@ -12,6 +12,7 @@ and channel plugins.
 | `sse` | SSE chunk parser |
 | `reconnect` | Exponential backoff retry helper |
 | `connection` | `WireConnection` class — lifecycle + message pipeline |
+| `ste-lint` | Warn-only ASD-STE100 linter for IPC and Slack messages. Reads the shared glossary and rules at call time (`STE_GLOSSARY_PATH`, `STE_RULES_PATH`; defaults under `/opt/agiterra/pod-tools/share/ste/`). Never blocks, never throws (AGI-154). |
 
 ## WireConnection
 
