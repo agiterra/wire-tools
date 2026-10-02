@@ -952,6 +952,56 @@ export async function startServer(): Promise<void> {
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
 
+  // ⛔ EXIT PATHS ARE ARMED HERE, BEFORE ANY AWAITED NETWORK STEP (2026-10-02, Baguette 651292).
+  // They used to be registered after `await conn.start()`, which resolves only on the first successful
+  // connect. Against an unreachable broker that await never resolved, so a server whose Claude Code had
+  // exited ignored stdin EOF and its own reparenting and lived forever (8 orphans on _ephemeral). In
+  // production: a lane exits during a broker outage, its server outlives it, and connects under the lane's
+  // identity when the broker returns. `conn` and `sessionFile` are filled in later; cleanup tolerates
+  // their absence.
+  //
+  // Every exit path logs its trigger before shutting down. Previously stdin
+  // end/close exited SILENTLY (no log), so the ~11h "wire-deaf after compaction"
+  // failures left zero trace of WHICH path killed the process. Never swallow an
+  // exit — log the reason so the fleet can see it (mcp-tee'd to
+  // ~/.wire/mcp-stderr/wire.log).
+  let conn: WireConnection | null = null;
+  let sessionFile: string | null = null;
+  let shuttingDown = false;
+  const cleanup = async (reason: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    // Backstop: whatever teardown does (a stop() racing a boot in flight included), the process exits.
+    setTimeout(() => {
+      log.error({ event: "shutdown_forced", reason }, "teardown did not finish in 5 s — exiting anyway");
+      process.exit(0);
+    }, 5000).unref();
+    log.warn({ event: "shutdown", reason, agentId: AGENT_ID, pid: process.pid }, `shutting down (${reason})`);
+    // Emit a final health line so every process leaves a last-known state.
+    log.info(health.snapshot(), "wire health (final)");
+    health.stop();
+    readyGate.dispose();
+    if (sessionFile) { try { unlinkSync(sessionFile); } catch {} }
+    if (conn) {
+      try { await conn.stop(); }
+      catch (e) { log.error({ event: "shutdown_stop_failed", reason, err: e }, "conn.stop() threw during shutdown"); }
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => cleanup("SIGTERM"));
+  process.on("SIGINT", () => cleanup("SIGINT"));
+  process.stdin.on("end", () => cleanup("stdin_end"));
+  process.stdin.on("close", () => cleanup("stdin_close"));
+
+  // Orphan detection: if Claude Code dies, we get reparented to PID 1
+  const parentPid = process.ppid;
+  setInterval(() => {
+    if (process.ppid !== parentPid) {
+      log.info({ event: "orphaned", parentPid, newPpid: process.ppid }, "parent died, exiting");
+      cleanup("orphaned");
+    }
+  }, 5000);
+
   // inbound=none (2.22.0, j:1512): this process serves CONTROL TOOLS ONLY. Another process (the wire-grok
   // sidecar) owns this agent's Wire stream and injects turns; opening a second SSE here made every packet
   // arrive twice (poll copy, then injection copy — Vacherin, Brioche 612640). No connection, no session
@@ -974,10 +1024,11 @@ export async function startServer(): Promise<void> {
   }
   // Session file: lets the SessionEnd hook disconnect this specific session
   const sessionDir = join(process.env.HOME ?? "/tmp", ".wire", "sessions");
-  const sessionFile = join(sessionDir, `${AGENT_ID}.${process.pid}.json`);
+  sessionFile = join(sessionDir, `${AGENT_ID}.${process.pid}.json`);
+  const sessionPath = sessionFile;
   mkdirSync(sessionDir, { recursive: true });
 
-  const conn = new WireConnection({
+  const c = new WireConnection({
     url: WIRE_URL,
     agentId: AGENT_ID,
     agentName: AGENT_NAME,
@@ -992,7 +1043,7 @@ export async function startServer(): Promise<void> {
       log.info({ event: "connected", sseSession: sessionId, ccSession: CC_SESSION_ID }, "connected");
       setConnState("connected", `session ${sessionId.slice(0, 8)}`);
       try {
-        writeFileSync(sessionFile, JSON.stringify({
+        writeFileSync(sessionPath, JSON.stringify({
           agentId: AGENT_ID,
           sessionId,
           ccSessionId: CC_SESSION_ID,
@@ -1007,7 +1058,7 @@ export async function startServer(): Promise<void> {
           caps: ["sighup-reconnect"],
         }));
       } catch (e) {
-        log.error({ event: "session_file_write_failed", path: sessionFile, err: e }, "failed to write session file");
+        log.error({ event: "session_file_write_failed", path: sessionPath, err: e }, "failed to write session file");
       }
     },
     onDisconnect: () => {
@@ -1038,15 +1089,17 @@ export async function startServer(): Promise<void> {
     },
   });
 
+  conn = c;
+
   // Register webhook envelope handler for IPC topic
-  conn.registerChannel("ipc", createWebhookChannelHandler());
+  c.registerChannel("ipc", createWebhookChannelHandler());
 
   // Brief delay before starting SSE — gives Claude Code time to fully
   // initialize channel support after MCP handshake. Without this, replay
   // messages during startup get acked but silently dropped by CC.
   await new Promise((r) => setTimeout(r, 2000));
 
-  await conn.start();
+  await c.start();
 
   // AGI-96 (c): from here on the process emits one `wire_health` line
   // immediately and then every HEALTH_INTERVAL_MS, so an outside watcher can
@@ -1078,38 +1131,7 @@ export async function startServer(): Promise<void> {
   // "sighup-reconnect" cap (written above).
   process.on("SIGHUP", () => {
     log.warn({ event: "sighup_reconnect" }, "SIGHUP received — forcing Wire reconnect");
-    conn.reconnect("sighup");
+    c.reconnect("sighup");
   });
 
-  // Every exit path logs its trigger before shutting down. Previously stdin
-  // end/close exited SILENTLY (no log), so the ~11h "wire-deaf after compaction"
-  // failures left zero trace of WHICH path killed the process. Never swallow an
-  // exit — log the reason so the fleet can see it (mcp-tee'd to
-  // ~/.wire/mcp-stderr/wire.log).
-  let shuttingDown = false;
-  const cleanup = async (reason: string) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    log.warn({ event: "shutdown", reason, agentId: AGENT_ID, pid: process.pid }, `shutting down (${reason})`);
-    // Emit a final health line so every process leaves a last-known state.
-    log.info(health.snapshot(), "wire health (final)");
-    health.stop();
-    readyGate.dispose();
-    try { unlinkSync(sessionFile); } catch {}
-    await conn.stop();
-    process.exit(0);
-  };
-  process.on("SIGTERM", () => cleanup("SIGTERM"));
-  process.on("SIGINT", () => cleanup("SIGINT"));
-  process.stdin.on("end", () => cleanup("stdin_end"));
-  process.stdin.on("close", () => cleanup("stdin_close"));
-
-  // Orphan detection: if Claude Code dies, we get reparented to PID 1
-  const parentPid = process.ppid;
-  setInterval(() => {
-    if (process.ppid !== parentPid) {
-      log.info({ event: "orphaned", parentPid, newPpid: process.ppid }, "parent died, exiting");
-      cleanup("orphaned");
-    }
-  }, 5000);
 }
