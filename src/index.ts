@@ -38,3 +38,6 @@ export {
 export { ReadyGate, WireNotReadyError, DEFAULT_READY_TIMEOUT_MS, type ReadyState } from "./ready-gate.js";
 export { HealthTracker, DEFAULT_HEALTH_INTERVAL_MS, type HealthSnapshot, type WireHealthState } from "./health.js";
 export { classifyWireError, classifyThrownWireError, formatWireError, type WireErrorClass, type WireErrorInfo } from "./auth-errors.js";
+
+// AGI-154: warn-only ASD-STE100 linter for IPC and Slack messages (glossary + rules read at call time)
+export { lintSte, steReport, steToolGuidance, payloadProse, parseGlossary, parseRulesConfig, DEFAULT_STE_GLOSSARY_PATH, DEFAULT_STE_RULES_PATH, type SteMode, type SteWarning, type SteLintOptions, type SteLintResult, type GlossaryEntry } from "./ste-lint.js";
