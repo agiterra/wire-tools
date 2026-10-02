@@ -22,7 +22,7 @@ export { createLogger, type Logger } from "./logger.js";
 export { generateKeyPair, exportPrivateKey, importPrivateKey, importKeyPair, signBody, derivePublicKeyB64, createAuthJwt, hashBody, type KeyPair } from "./crypto.js";
 export { register, registerOrRefresh, connect, disconnect, ack, heartbeat, setPlan, sendSignedMessage, listWebhooks, setWebhookFilter, type RegisterMode, type RegisterOrRefreshResult, type WebhookSummary } from "./http.js";
 export { parseSSEChunk } from "./sse.js";
-export { RpcClient, RpcResponder, RpcTimeoutError, RpcRemoteError, RPC_REQUEST_TOPIC, RPC_REPLY_TOPIC, type RpcRequestPayload, type RpcReplyPayload, type RpcHandler, type RpcHandlerContext, type RpcSend, type RpcClientOptions, type RpcResponderOptions } from "./rpc.js";
+export { RpcClient, RpcResponder, RpcTimeoutError, RpcRemoteError, RPC_REQUEST_TOPIC, RPC_REPLY_TOPIC, MALFORMED_RPC_FALLBACK_TOPIC, type RpcRequestPayload, type RpcReplyPayload, type RpcHandler, type RpcHandlerContext, type RpcSend, type RpcClientOptions, type RpcResponderOptions } from "./rpc.js";
 export { retryWithBackoff } from "./reconnect.js";
 
 // MCP server (shared by claude-code and codex adapters)

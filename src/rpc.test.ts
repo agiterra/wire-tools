@@ -7,6 +7,7 @@ import {
   RpcRemoteError,
   RPC_REQUEST_TOPIC,
   RPC_REPLY_TOPIC,
+  MALFORMED_RPC_FALLBACK_TOPIC,
   isSafeReplyTopic, } from "./rpc.js";
 
 const KEY = {} as CryptoKey; // never used — send is injected everywhere
@@ -238,14 +239,16 @@ describe("malformed rpc request (j:1480)", () => {
     expect(sent[0].dest).toBe("brioche");
     expect(sent[0].payload.ok).toBe(false);
   });
-  test("no reply_topic falls back to the constant", async () => {
+  test("no reply_topic falls back to a VISIBLE topic, never the feed-dropped constant", async () => {
     const sent: any[] = []; await mkResponder(sent).handleEvent(malformed());
-    expect(sent[0].topic).toBe(RPC_REPLY_TOPIC);
+    expect(sent[0].topic).toBe(MALFORMED_RPC_FALLBACK_TOPIC);
+    expect(sent[0].topic).not.toBe(RPC_REPLY_TOPIC);
+    expect(sent[0].dest).toBe("brioche");
   });
   test("unsafe reply topics fall back instead of being honoured", async () => {
     for (const bad of ["wire.keepalive", "webhook.wire.control", "../etc", "a b", "", "x".repeat(65), 42, null, {}]) {
       const sent: any[] = []; await mkResponder(sent).handleEvent(malformed(bad));
-      expect(sent[0].topic).toBe(RPC_REPLY_TOPIC);
+      expect(sent[0].topic).toBe(MALFORMED_RPC_FALLBACK_TOPIC);
     }
   });
   test("isSafeReplyTopic accepts ordinary names and refuses reserved/odd ones", () => {

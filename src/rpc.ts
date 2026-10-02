@@ -31,6 +31,8 @@ import { sendSignedMessage } from "./http.js";
 
 export const RPC_REQUEST_TOPIC = "rpc.request";
 export const RPC_REPLY_TOPIC = "rpc.reply";
+/** Topic for a malformed request's error when the request names no safe reply_topic: one every channel feed delivers. */
+export const MALFORMED_RPC_FALLBACK_TOPIC = "ipc";
 
 /**
  * The broker's webhook ingress prefixes delivered topics with "webhook."
@@ -262,8 +264,12 @@ export class RpcResponder {
         this.log(`refused malformed rpc from '${event.source}': ${error}`);
         try {
           // Honour a SAFE supplied reply topic so a malformed request's error is visible to
-          // its sender; fall back to the constant when absent or unsafe.
-          const errorTopic = isSafeReplyTopic(rpc?.reply_topic) ? (rpc!.reply_topic as string) : RPC_REPLY_TOPIC;
+          // its sender; otherwise fall back to MALFORMED_RPC_FALLBACK_TOPIC ("ipc"), NOT RPC_REPLY_TOPIC.
+          // Every channel feed drops RPC_REPLY_TOPIC (it is reserved for managed clients), and managed
+          // clients always set rpc.id + rpc.reply_to, so they never reach this path. Only hand-sent
+          // requests do, and on the constant their error was delivered and seen by nobody (Baguette
+          // crew.agent_stop 2026-10-02 21:06Z: refused, nothing executed, "no rpc.reply").
+          const errorTopic = isSafeReplyTopic(rpc?.reply_topic) ? (rpc!.reply_topic as string) : MALFORMED_RPC_FALLBACK_TOPIC;
           await this.send(errorTopic, { rpc: { id: rpc?.id ?? null }, ok: false, error }, event.source);
         } catch (e) {
           this.log(`malformed-rpc reply send failed → ${event.source}`, e);
