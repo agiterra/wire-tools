@@ -107,20 +107,46 @@ function splitRow(line: string): string[] | null {
   return cells.length >= 3 ? cells : null;
 }
 
-/** Parse the glossary's markdown table. Header and separator rows are skipped; prose is ignored. */
+const isSeparatorRow = (cells: string[] | null) => !!cells && cells.every((c) => /^:?-{3,}:?$/.test(c));
+/** A term must carry a letter or digit: "", "—" or "()" would match everywhere or nowhere. */
+const isTerm = (s: string) => /[\p{L}\p{N}]/u.test(s);
+
+/** Split at commas that are not inside parentheses. */
+function splitTopLevel(cell: string): string[] {
+  const out: string[] = [];
+  let depth = 0, cur = "";
+  for (const ch of cell) {
+    if (ch === "(") depth++;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    if (ch === "," && depth === 0) { out.push(cur); cur = ""; } else cur += ch;
+  }
+  out.push(cur);
+  return out.map((x) => x.trim()).filter(Boolean);
+}
+
+/**
+ * Parse the glossary's markdown table. The row before a separator row is a header; prose is ignored.
+ * A "(when …)" qualifier may sit on any item ("restart, reboot (for a context clear), compaction"). Any qualifier
+ * in a row makes the WHOLE row context-dependent: the trailing one scopes the whole list
+ * ("issue, task, card (when meaning a Linear issue)"), and a mid-list one leaves the scope of its neighbours
+ * unclear — so a row with a qualifier never produces a hard warning.
+ */
 export function parseGlossary(md: string): GlossaryEntry[] {
   const entries: GlossaryEntry[] = [];
-  for (const line of md.split("\n")) {
-    const cells = splitRow(line);
-    if (!cells) continue;
+  const lines = md.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const cells = splitRow(lines[i]);
+    if (!cells || isSeparatorRow(cells) || isSeparatorRow(splitRow(lines[i + 1] ?? ""))) continue;
     const [approved, bannedCell, meaning] = cells;
-    if (/^:?-{3,}:?$/.test(approved) || /^approved name$/i.test(approved)) continue;
-    // A trailing "(when …)" qualifier scopes the WHOLE list ("issue, task, card, item (when meaning a Linear issue)").
-    const q = bannedCell.match(/\(([^()]*)\)\s*$/);
-    const qualifier = q ? q[1].trim() : null;
-    const list = q ? bannedCell.slice(0, q.index).trim() : bannedCell;
-    for (const b of list.split(",").map((s) => s.trim()).filter(Boolean)) {
-      entries.push({ approved, banned: b, qualifier, meaning });
+    if (!isTerm(approved)) continue;
+    const items = splitTopLevel(bannedCell).map((item) => {
+      const q = item.match(/\(([^()]*)\)\s*$/);
+      return { banned: (q ? item.slice(0, q.index) : item).trim(), qualifier: q ? q[1].trim() : null };
+    });
+    const rowQualifier = items.find((x) => x.qualifier !== null)?.qualifier ?? null;
+    for (const it of items) {
+      if (!isTerm(it.banned)) continue;
+      entries.push({ approved, banned: it.banned, qualifier: it.qualifier ?? rowQualifier, meaning });
     }
   }
   return entries;
@@ -140,7 +166,9 @@ export function parseRulesConfig(md: string): SteConfig {
   }
   for (const k of ["extra_phrasal_verbs", "extra_marketing_adjectives"] as const) {
     if (raw[k] !== undefined) {
-      if (!Array.isArray(raw[k]) || raw[k]!.some((s) => typeof s !== "string")) throw new Error(`${k} must be a string array`);
+      if (!Array.isArray(raw[k]) || raw[k]!.some((s) => typeof s !== "string" || !isTerm(s))) {
+        throw new Error(`${k} must be an array of non-blank strings, got ${JSON.stringify(raw[k])}`);
+      }
       cfg[k] = raw[k]!;
     }
   }
@@ -152,11 +180,16 @@ export function stripNonProse(text: string): string {
   return text
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`[^`\n]*`/g, " CODE ")
-    .replace(/<[@#!][^>]*>/g, " NAME ")
-    .replace(/<https?:[^>]*>/g, " LINK ")
+    // Bounded and whitespace-free: an unclosed "<" must not scan (quadratically) to a ">" lines away.
+    .replace(/<[@#!][^>\s]{0,200}>/g, " NAME ")
+    .replace(/<https?:[^>\s]{0,2000}>/g, " LINK ")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
     .replace(/\bhttps?:\/\/\S+/g, " LINK ")
-    .replace(/(?:^|\s)(?:~|\.{0,2})?\/[\w.\-/]+/g, " PATH ");
+    // Per token (linear — no regex backtracking over one long token): a token with a slash is a path, a ref or an
+    // id (scripts/restart.sh, origin/main, 3/4); a token ending in a file extension is a file name. Neither is prose.
+    .replace(/\S+/g, (tok) => (tok.includes("/") ? " PATH " : FILE_TOKEN.test(tok) ? " FILE " : tok));
 }
+const FILE_TOKEN = /^[("'`]*[\w.-]+\.(?:sh|ts|tsx|js|mjs|md|json|jsonl|py|ya?ml|txt|log|toml|sql|db|tsv|csv|plist|env|lock)[)"'`,:.]*$/i;
 
 function sentences(prose: string): string[] {
   const out: string[] = [];
@@ -201,14 +234,21 @@ export function lintSte(text: string, opts: SteLintOptions): SteLintResult {
   const approvedNames = new Set(
     glossary.flatMap((g) => g.approved.split(/\s*\/\s*/)).map((s) => s.toLowerCase()),
   );
+  // When two rows ban the same word, the qualified (advisory) row wins: one context-dependent row is enough doubt.
+  const byTerm = new Map<string, GlossaryEntry>();
   for (const g of glossary) {
+    const k = g.banned.toLowerCase();
+    const prev = byTerm.get(k);
+    if (!prev || (prev.qualifier === null && g.qualifier !== null)) byTerm.set(k, g);
+  }
+  for (const g of byTerm.values()) {
     // A banned word that is itself an approved name ("cycle", "release", "reboot") is legal in its own sense;
     // only the context can tell, and a warning on every use would teach readers to skip the list.
     if (approvedNames.has(g.banned.toLowerCase())) continue;
     const re = new RegExp(`(?<![\\w-])${escapeRe(g.banned)}(?:s|es)?(?![\\w-])`, "i");
     const m = prose.match(re);
     if (!m) continue;
-    if (g.qualifier) {
+    if (g.qualifier !== null) {
       add({ rule: "glossary", level: "advisory", match: m[0],
         message: `"${m[0]}": if you mean ${g.meaning}, write "${g.approved}" (glossary: ${g.qualifier}).` });
     } else {
@@ -262,6 +302,9 @@ export function lintSte(text: string, opts: SteLintOptions): SteLintResult {
   return { warnings, errors, words };
 }
 
+/** Payload fields that carry machine text, not prose: a semicolon in a shell command is not a style error. */
+const NON_PROSE_KEYS = /^(?:command|cmd|argv|args|log|logs|stack|stderr|stdout|output|diff|patch|code|sql|query|script|path|paths|url|urls|sha|hash|id|ids|ts|thread_ts|channel)$/i;
+
 /** Every prose string inside an IPC payload (any JSON shape). Keys are not prose; short tokens are not either. */
 export function payloadProse(payload: unknown): string[] {
   const out: string[] = [];
@@ -269,7 +312,9 @@ export function payloadProse(payload: unknown): string[] {
     if (depth > 8) return;
     if (typeof v === "string") { if (countWords(v) >= 3) out.push(v); }
     else if (Array.isArray(v)) v.forEach((x) => walk(x, depth + 1));
-    else if (v && typeof v === "object") Object.values(v).forEach((x) => walk(x, depth + 1));
+    else if (v && typeof v === "object") {
+      for (const [k, x] of Object.entries(v)) if (!NON_PROSE_KEYS.test(k)) walk(x, depth + 1);
+    }
   };
   walk(payload, 0);
   return out;
@@ -279,11 +324,14 @@ export function payloadProse(payload: unknown): string[] {
  * The text a send tool appends to its result. Empty string when there is nothing to say.
  * Never throws: a linter defect is itself reported as a line, with the stack on stderr.
  */
-export function steReport(texts: string[], opts: SteLintOptions, maxLines = 8): string {
+export function steReport(inputs: unknown[], opts: SteLintOptions, maxLines = 8): string {
   try {
     const all: SteWarning[] = [];
     const errors = new Set<string>();
     const seen = new Set<string>();
+    // A string is linted as-is; anything else (an IPC payload, Slack blocks) is walked for prose. Inside the try:
+    // the callers have ALREADY sent, so nothing here may surface as a send failure.
+    const texts = inputs.flatMap((x) => (typeof x === "string" ? [x] : payloadProse(x)));
     for (const t of texts) {
       const r = lintSte(t, opts);
       r.errors.forEach((e) => errors.add(e));
@@ -301,7 +349,7 @@ export function steReport(texts: string[], opts: SteLintOptions, maxLines = 8): 
     return `\nSTE (${opts.mode}, warn-only — the message was sent): ${hardN} hard, ${all.length - hardN} advisory.\n${lines.join("\n")}`;
   } catch (e) {
     const err = e as Error;
-    console.error("[ste-lint] linter failed", { mode: opts.mode, texts: texts.length }, err.stack ?? err);
+    console.error("[ste-lint] linter failed", { mode: opts.mode, inputs: inputs.length }, err.stack ?? err);
     return `\nSTE linter error (the message was sent): ${err.message}`;
   }
 }

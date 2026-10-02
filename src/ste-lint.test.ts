@@ -197,3 +197,83 @@ describe("steReport", () => {
     expect(rep).toContain("[ste-lint error] glossary not loaded from /nonexistent/g.md");
   });
 });
+
+// Regressions from the adversarial review of 59537c5 (2026-10-02).
+const REAL_SHAPED = `| Approved name | Banned synonyms | Meaning |
+|---|---|---|
+| recycle | restart, reboot (for a context clear), compaction | save state, clear context, boot again |
+| reboot | restart (for the host) | the host restart |
+| reviewer | seat (when single), board (when single) | one review lane |
+| worktree | checkout, clone | a git worktree |
+| blank | —, () | nothing |
+`;
+
+describe("review regressions", () => {
+  test("a mid-list qualifier is parsed per item and makes the row advisory", () => {
+    const g = parseGlossary(REAL_SHAPED);
+    const recycle = g.filter((e) => e.approved === "recycle");
+    expect(recycle.map((e) => e.banned)).toEqual(["restart", "reboot", "compaction"]);
+    expect(recycle.every((e) => e.qualifier !== null)).toBe(true);
+    expect(g.filter((e) => e.approved === "reviewer").map((e) => e.banned)).toEqual(["seat", "board"]);
+  });
+
+  test("'restart' is advisory, never hard", () => {
+    const f = fixture(REAL_SHAPED);
+    const w = lintSte("I restart the service now.", { mode: "slack", ...f }).warnings.filter((x) => x.rule === "glossary");
+    expect(w.length).toBe(1);
+    expect(w[0].level).toBe("advisory");
+  });
+
+  test("blank and punctuation-only glossary cells are not terms", () => {
+    const g = parseGlossary(REAL_SHAPED);
+    expect(g.some((e) => e.approved === "blank")).toBe(false);
+    const f = fixture(REAL_SHAPED);
+    expect(lintSte("Done — next step.", { mode: "slack", ...f }).warnings).toEqual([]);
+  });
+
+  test("a blank extra word in the rules config is an error, not a match-everything regex", () => {
+    const f = fixture(REAL_SHAPED, "```json ste-lint-config\n{\"extra_phrasal_verbs\": [\"\"]}\n```");
+    const r = lintSte("hello there friend", { mode: "slack", ...f });
+    expect(r.errors[0]).toContain("extra_phrasal_verbs");
+    expect(r.warnings).toEqual([]);
+  });
+
+  test("relative paths, refs and file names are not prose", () => {
+    const f = fixture(REAL_SHAPED);
+    expect(lintSte("Edit scripts/restart.sh and checkout.sh, then push origin/main.", { mode: "slack", ...f }).warnings).toEqual([]);
+  });
+
+  test("an unclosed '<' does not eat prose across lines, and is linear", () => {
+    const f = fixture(REAL_SHAPED);
+    expect(rules(lintSte("x <! a line\nnext; line\n> end", { mode: "slack", ...f }))).toContain("semicolon");
+    const t0 = performance.now();
+    lintSte("<!".repeat(100_000), { mode: "slack", ...f });
+    lintSte("a".repeat(200_000), { mode: "slack", ...f });
+    expect(performance.now() - t0).toBeLessThan(1500);
+  });
+
+  test("Slack-escaped &amp; is not a semicolon", () => {
+    const f = fixture(REAL_SHAPED);
+    expect(lintSte("Tom &amp; Jerry left.", { mode: "slack", ...f }).warnings).toEqual([]);
+  });
+
+  test("machine-text payload fields are not linted", () => {
+    expect(payloadProse({ command: "cd /x; bun test now", text: "I run the tests now." })).toEqual(["I run the tests now."]);
+  });
+
+  test("steReport takes raw payloads and survives non-strings", () => {
+    const f = fixture(REAL_SHAPED);
+    const rep = steReport([42, null, { text: "Open the checkout now." }, undefined], { mode: "slack", ...f });
+    expect(rep).toContain('"checkout": write "worktree"');
+  });
+});
+
+test("when a hard row and an advisory row ban the same word, advisory wins (either order)", () => {
+  const hardFirst = "| A | Banned | M |\n|---|---|---|\n| lane | worker | a lane |\n| job | worker (when meaning CI) | a CI job |\n";
+  const advFirst = "| A | Banned | M |\n|---|---|---|\n| job | worker (when meaning CI) | a CI job |\n| lane | worker | a lane |\n";
+  for (const g of [hardFirst, advFirst]) {
+    const f = fixture(g);
+    const w = lintSte("The worker stopped.", { mode: "slack", ...f }).warnings.filter((x) => x.rule === "glossary");
+    expect(w.map((x) => x.level)).toEqual(["advisory"]);
+  }
+});
