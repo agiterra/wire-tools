@@ -341,12 +341,15 @@ export function steReport(inputs: unknown[], opts: SteLintOptions, maxLines = 8)
       }
     }
     if (!all.length && !errors.size) return "";
-    all.sort((a, b) => (a.level === b.level ? 0 : a.level === "hard" ? -1 : 1));
-    const lines = all.slice(0, maxLines).map((w) => `- [${w.level === "hard" ? w.rule : w.rule + "?"}] ${w.message}`);
-    if (all.length > maxLines) lines.push(`- …and ${all.length - maxLines} more`);
+    // Terse by design (Brioche 655516, 2026-10-03 audit): the echo is billed on BOTH sides of every send, ~300-600 tokens
+    // each, ~30k/hour across the fleet. Advisories are never listed; with 0 hard the report is one line of counts.
+    const hard = all.filter((w) => w.level === "hard");
+    const advN = all.length - hard.length;
+    if (!hard.length && !errors.size) return `\nSTE: 0 hard, ${advN} advisory.`;
+    const lines = hard.slice(0, maxLines).map((w) => `- [${w.rule}] ${w.message}`);
+    if (hard.length > maxLines) lines.push(`- …and ${hard.length - maxLines} more`);
     for (const e of errors) lines.push(`- [ste-lint error] ${e}`);
-    const hardN = all.filter((w) => w.level === "hard").length;
-    return `\nSTE (${opts.mode}, warn-only — the message was sent): ${hardN} hard, ${all.length - hardN} advisory.\n${lines.join("\n")}`;
+    return `\nSTE (${opts.mode}, warn-only — the message was sent): ${hard.length} hard.\n${lines.join("\n")}`;
   } catch (e) {
     const err = e as Error;
     console.error("[ste-lint] linter failed", { mode: opts.mode, inputs: inputs.length }, err.stack ?? err);
