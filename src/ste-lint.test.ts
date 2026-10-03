@@ -186,6 +186,23 @@ describe("steReport", () => {
     expect(many).toMatch(/…and \d+ more/);
   });
 
+  test("terse (Brioche 655516): 0 hard -> ONE line of counts; hard -> hard lines only, never an advisory line", () => {
+    const advText = "The job was run by the team.";
+    const probe = lintSte(advText, { mode: "strict", ...fixture() });
+    expect(probe.warnings.length).toBeGreaterThan(0);
+    expect(probe.warnings.every((w) => w.level === "advisory")).toBe(true);
+    const advOnly = steReport([{ text: advText }], { mode: "strict", ...fixture() }).trim();
+    expect(advOnly).toBe(`STE: 0 hard, ${probe.warnings.length} advisory.`);
+    const mixed = steReport(["Open the checkout; it was merged by the bot and the robust seamless job was run."], { mode: "strict", ...fixture() });
+    expect(mixed).toMatch(/: \d+ hard\.\n/);
+    expect(mixed).not.toContain("advisory");
+    const mixedProbe = lintSte("Open the checkout; it was merged by the bot and the robust seamless job was run.", { mode: "strict", ...fixture() });
+    const hardN = mixedProbe.warnings.filter((w) => w.level === "hard").length;
+    expect(mixedProbe.warnings.length).toBeGreaterThan(hardN); // the input DOES carry advisories, so their absence means something
+    expect(mixed).toContain(`: ${hardN} hard.\n`);
+    expect(mixed.trim().split("\n").slice(1).length).toBe(Math.min(hardN, 8));
+  });
+
   test("dedupes the same warning across several payload strings", () => {
     const f = fixture();
     const rep = steReport(["Open the checkout now.", "Close the checkout now."], { mode: "slack", ...f });
