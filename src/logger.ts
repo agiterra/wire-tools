@@ -21,7 +21,9 @@ export function createLogger(
 ): pino.Logger {
   let target: pino.DestinationStream;
   if (typeof dest === "string") {
-    target = pino.destination({ dest, append: true, mkdir: true, sync: false });
+    // sync: the fd opens before this returns. Async open lost the line and, under bun >= 1.4.4, turned pino's
+    // exit flush ("sonic boom is not ready yet") into exit code 1 for any process that exits right after import.
+    target = pino.destination({ dest, append: true, mkdir: true, sync: true });
   } else {
     target = pino.destination(dest ?? 1);
   }
