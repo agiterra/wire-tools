@@ -95,3 +95,23 @@ describe("summarizeHeartbeats (heartbeat_list summary:true)", () => {
     expect(Object.keys((t.inputSchema as any).properties)).toEqual(["agent_id", "summary"]);
   });
 });
+
+describe("heartbeat_delete argument validation", () => {
+  for (const args of [{}, { heartbeat_id: "hb-1234" }, { id: "" }, { id: 42 }]) {
+    test(`rejects ${JSON.stringify(args)} without calling the broker`, async () => {
+      const { client } = await connectedClient("none");
+      const realFetch = globalThis.fetch;
+      let called = false;
+      globalThis.fetch = (async () => { called = true; return new Response("{}"); }) as any;
+      try {
+        const res: any = await client.callTool({ name: "heartbeat_delete", arguments: args as any });
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toContain("'id' is required");
+        expect(res.content[0].text).not.toContain("heartbeat deleted");
+        expect(called).toBe(false);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    });
+  }
+});

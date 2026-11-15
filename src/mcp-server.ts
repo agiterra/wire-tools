@@ -536,11 +536,19 @@ export function registerWireTools(server: Server, ctx: WireToolsContext): void {
     }
 
     if (req.params.name === "heartbeat_delete") {
-      const { id } = req.params.arguments as { id: string };
+      // The broker answers 200 for ANY id, so a missing/misnamed arg (e.g. heartbeat_id) used to
+      // DELETE /heartbeats/undefined and report "heartbeat deleted: undefined" while deleting nothing.
+      const id = (req.params.arguments as Record<string, unknown> | undefined)?.id;
+      if (typeof id !== "string" || id.trim() === "") {
+        return {
+          content: [{ type: "text" as const, text: `heartbeat_delete: 'id' is required (string, from heartbeat_list). Got: ${JSON.stringify(req.params.arguments ?? {})}. Nothing was deleted.` }],
+          isError: true,
+        };
+      }
       try {
         keyPair = await ensureWire();
         const token = await createAuthJwt(keyPair.privateKey, ctx.agentId, "");
-        const res = await fetch(`${ctx.wireUrl}/heartbeats/${id}`, {
+        const res = await fetch(`${ctx.wireUrl}/heartbeats/${encodeURIComponent(id)}`, {
           method: "DELETE",
           headers: { Authorization: `Bearer ${token}` },
         });
