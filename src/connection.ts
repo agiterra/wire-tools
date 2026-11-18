@@ -78,6 +78,27 @@ export type EnrichmentContext = {
 
 export type Enricher = (ctx: EnrichmentContext) => Promise<EnrichmentResult[]>;
 
+/**
+ * Text for an event that no channel handler claims (e.g. topic "webhook.ipc", which the "ipc" handler does not match).
+ *
+ * An IPC envelope (plugin === "ipc") loses its `headers` field: those are the HTTP headers of the agent-to-agent POST
+ * (accept, accept-encoding, connection, content-length, content-type, host, user-agent) and carry nothing an agent reads.
+ * Measured 2026-11-18 (Brioche 909616/909630, GO 909632): 42 channel events in one Baguette seat = 43.3k chars, of which
+ * headers 8.0k (19%) and payload 18.2k. Every other field stays (source, topic, dest, plugin, payload), in order.
+ * Any other plugin keeps its headers: a GitHub/Linear webhook's event type lives there (x-github-event).
+ */
+export function passthroughText(payload: unknown): string {
+  if (typeof payload === "string") return payload;
+  if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+    const env = payload as Record<string, unknown>;
+    if (env.plugin === "ipc" && "headers" in env) {
+      const { headers: _headers, ...rest } = env;
+      return JSON.stringify(rest);
+    }
+  }
+  return JSON.stringify(payload);
+}
+
 // --- Delivery types ---
 
 export type DeliveryPayload = {
@@ -486,10 +507,7 @@ export class WireConnection {
     } else {
       // No handler — pass through raw payload as text
       channelResult = {
-        text:
-          typeof event.payload === "string"
-            ? event.payload
-            : JSON.stringify(event.payload),
+        text: passthroughText(event.payload),
         metadata: { source: event.source, topic: event.topic },
       };
       this.log.debug({ event: "passthrough", seq: event.seq, text: channelResult.text.slice(0, 100) }, "PASSTHROUGH");
